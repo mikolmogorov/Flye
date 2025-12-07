@@ -5,6 +5,7 @@ Table of Contents
 -----------------
 
 - [Quick usage](#quickusage)
+- [Docker Usage](#docker)
 - [Examples](#examples)
 - [Supported Input Data](#inputdata)
 - [Parameter Descriptions](#parameters)
@@ -94,6 +95,189 @@ assembly by specifying `--asm-coverage` and `--genome-size` options. Typically,
 
 You can run Flye polisher as a standalone tool using
 `--polish-target` option.
+
+## <a name="docker"></a> Docker Usage
+
+Flye can be run using Docker, which provides a containerized environment with all dependencies pre-installed.
+This eliminates the need to install build tools and ensures consistent behavior across different systems.
+
+### Basic Docker Usage
+
+The general pattern for running Flye in Docker is:
+
+```bash
+docker run --rm -v /path/to/data:/data flye:2.9.6 [flye arguments]
+```
+
+Where:
+- `--rm` removes the container after it exits (recommended for cleanup)
+- `-v /path/to/data:/data` mounts your data directory into the container
+- The container's working directory is `/data`, so paths are relative to your mounted directory
+
+**Platform-specific mounting:**
+
+- **Linux/MacOS (bash/zsh):**
+  ```bash
+  docker run --rm -v $(pwd):/data flye:2.9.6 --help
+  ```
+
+- **Windows PowerShell:**
+  ```powershell
+  docker run --rm -v ${PWD}:/data flye:2.9.6 --help
+  ```
+
+- **Windows CMD:**
+  ```cmd
+  docker run --rm -v %cd%:/data flye:2.9.6 --help
+  ```
+
+- **Using absolute paths (all platforms):**
+  ```bash
+  docker run --rm -v /home/user/mydata:/data flye:2.9.6 --help
+  ```
+  Or on Windows:
+  ```cmd
+  docker run --rm -v C:\Users\username\mydata:/data flye:2.9.6 --help
+  ```
+
+### Docker Examples
+
+#### E. coli assembly with PacBio data
+
+Assuming your reads are in the current directory:
+
+**Linux/MacOS:**
+```bash
+docker run --rm -v $(pwd):/data flye:2.9.6 \
+    --pacbio-raw reads.fastq \
+    --out-dir assembly_output \
+    --threads 4
+```
+
+**Windows PowerShell:**
+```powershell
+docker run --rm -v ${PWD}:/data flye:2.9.6 `
+    --pacbio-raw reads.fastq `
+    --out-dir assembly_output `
+    --threads 4
+```
+
+**Using absolute path (any platform):**
+```bash
+docker run --rm -v /absolute/path/to/data:/data flye:2.9.6 \
+    --pacbio-raw reads.fastq \
+    --out-dir assembly_output \
+    --threads 4
+```
+
+#### E. coli assembly with ONT data
+
+**Linux/MacOS:**
+```bash
+docker run --rm -v $(pwd):/data flye:2.9.6 \
+    --nano-raw ont_reads.fastq \
+    --out-dir assembly_output \
+    --threads 4
+```
+
+**Windows CMD:**
+```cmd
+docker run --rm -v %cd%:/data flye:2.9.6 --nano-raw ont_reads.fastq --out-dir assembly_output --threads 4
+```
+
+#### Using absolute paths
+
+If your data is in a specific directory:
+
+**Linux/MacOS:**
+```bash
+docker run --rm -v /home/user/my_data:/data flye:2.9.6 \
+    --pacbio-hifi hifi_reads.fastq.gz \
+    --out-dir assembly_output \
+    --genome-size 5m \
+    --threads 8
+```
+
+**Windows:**
+```powershell
+docker run --rm -v C:\Users\username\my_data:/data flye:2.9.6 `
+    --pacbio-hifi hifi_reads.fastq.gz `
+    --out-dir assembly_output `
+    --genome-size 5m `
+    --threads 8
+```
+
+#### Metagenome assembly
+
+```bash
+# Linux/MacOS
+docker run --rm -v $(pwd):/data flye:2.9.6 \
+    --nano-hq reads.fastq.gz \
+    --out-dir meta_assembly \
+    --meta \
+    --threads 16
+
+# Or with absolute path (any platform)
+docker run --rm -v /full/path/to/data:/data flye:2.9.6 \
+    --nano-hq reads.fastq.gz \
+    --out-dir meta_assembly \
+    --meta \
+    --threads 16
+```
+
+#### Checking version
+
+```bash
+docker run --rm flye:2.9.6 --version
+```
+
+### Important Notes for Docker Usage
+
+1. **File paths**: All file paths in Flye arguments should be relative to the mounted directory. If you mount `/home/user/data` to `/data`, and your reads are at `/home/user/data/reads.fastq`, you should use just `reads.fastq` in the Flye command.
+
+2. **Output directory**: The output directory will be created inside the mounted volume, so it will persist after the container exits.
+
+3. **Permissions**: Output files will be owned by the root user by default. You can change ownership after assembly:
+   ```bash
+   sudo chown -R $(id -u):$(id -g) assembly_output
+   ```
+
+4. **Multiple input files**: You can specify multiple input files as usual:
+   ```bash
+   # Linux/MacOS
+   docker run --rm -v $(pwd):/data flye:2.9.6 \
+       --pacbio-raw reads1.fastq reads2.fastq reads3.fastq \
+       --out-dir assembly_output
+
+   # Windows PowerShell
+   docker run --rm -v ${PWD}:/data flye:2.9.6 `
+       --pacbio-raw reads1.fastq reads2.fastq reads3.fastq `
+       --out-dir assembly_output
+
+   # Using absolute path (any platform)
+   docker run --rm -v /path/to/data:/data flye:2.9.6 \
+       --pacbio-raw reads1.fastq reads2.fastq reads3.fastq \
+       --out-dir assembly_output
+   ```
+
+5. **Resource limits**: You can limit Docker's resource usage:
+   ```bash
+   # Linux/MacOS
+   docker run --rm -v $(pwd):/data \
+       --cpus="8" \
+       --memory="32g" \
+       flye:2.9.6 \
+       --pacbio-hifi reads.fastq \
+       --out-dir assembly_output
+
+   # Using absolute path (any platform)
+   docker run --rm -v /absolute/path/to/data:/data \
+       --cpus="8" \
+       --memory="32g" \
+       flye:2.9.6 \
+       --pacbio-hifi reads.fastq \
+       --out-dir assembly_output
+   ```
 
 ## <a name="examples"></a> Examples
 

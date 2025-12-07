@@ -16,6 +16,33 @@ You can get the latest stable release through Bioconda:
 Alternatively, you can get a release version from the github releases page
 
 
+Docker Installation
+-------------------
+
+Flye is also available as a Docker image, which provides a complete, isolated environment
+with all dependencies pre-installed. This is the easiest way to get started.
+
+### Using Pre-built Docker Image (CURRENTLY NOT AVAILABLE)
+
+Once available on Docker Hub: 
+
+    docker pull fenderglass/flye:latest
+
+### Building Docker Image from Source
+
+To build the Docker image from the Flye repository:
+
+    git clone https://github.com/fenderglass/Flye
+    cd Flye
+    docker build -t flye:2.9.6 .
+
+After building or pulling the image, you can run Flye with:
+
+    docker run --rm -v $(pwd):/data flye:2.9.6 --help
+
+See the [Usage documentation](USAGE.md#docker-usage) for more details on running Flye with Docker.
+
+
 Building Requirements
 ---------------------
 
