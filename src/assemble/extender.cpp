@@ -283,7 +283,7 @@ void Extender::assembleDisjointigs()
 		//store overlap information for many trashy reads
 		//that won't result into disjointig extension
 		auto startOvlps = _ovlpContainer.quickSeqOverlaps(startRead, 
-														  /*max overlaps*/ 100);
+														  /*max overlaps*/ 0);
 		int numInnerOvlp = 0;
 		int totalOverlaps = 0;
 		for (const auto& ovlp : IterNoOverhang(startOvlps))
