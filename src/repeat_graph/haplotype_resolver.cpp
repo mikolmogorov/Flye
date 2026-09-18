@@ -1,7 +1,9 @@
 #include "haplotype_resolver.h"
 #include "graph_processing.h"
+#include "../common/parallel.h"
 #include <queue>
 #include <set>
+#include <functional>
 
 //This function collapses simple bubbles caused by
 //alternative haplotypes / strains. They are defined as follows:
@@ -490,30 +492,65 @@ int HaplotypeResolver::findRoundabouts()
 		}
 	}
 
-	std::unordered_set<GraphEdge*> usedEdges;
-	std::vector<VariantPaths> foundVariants;
+	//Candidate start edges in unbranching path order (kept for determinism)
+	std::vector<GraphEdge*> candidates;
 	for (auto& startPath: unbranchingPaths)
 	{
 		GraphEdge* startEdge = startPath.path.back();
-		//if (startEdge->nodeRight->outEdges.size() < 2) continue;
 		if (loopedEdges.count(startEdge)) continue;
-		if (usedEdges.count(startEdge)) continue;
-		
-		auto varSeg = this->findVariantSegment(startEdge, alnIndex[startEdge], 
-											   loopedEdges);
-		if (varSeg.startEdge && varSeg.endEdge &&
-			varSeg.startEdge != _graph.complementEdge(varSeg.endEdge))
+		candidates.push_back(startEdge);
+	}
+
+	//Search phase (parallel): findVariantSegment only reads the graph,
+	//the alignment index and looped edges. The index is accessed through
+	//find() so that no thread inserts into the shared map.
+	struct RoundaboutSearch
+	{
+		RoundaboutSearch(): valid(false) {}
+		VariantPaths varSeg;
+		VariantPaths revSeg;
+		bool valid;
+	};
+	std::vector<RoundaboutSearch> results(candidates.size());
+	std::vector<size_t> candIds;
+	for (size_t i = 0; i < candidates.size(); ++i) candIds.push_back(i);
+	const std::vector<GraphAlignment> noAlignments;
+	auto alignmentsOf = [&alnIndex, &noAlignments](GraphEdge* edge) 
+		-> const std::vector<GraphAlignment>&
+	{
+		auto it = alnIndex.find(edge);
+		return it != alnIndex.end() ? it->second : noAlignments;
+	};
+	std::function<void(const size_t&)> searchRoundabout = 
+	[this, &candidates, &results, &loopedEdges, &alignmentsOf](const size_t& i)
+	{
+		GraphEdge* startEdge = candidates[i];
+		auto& res = results[i];
+		res.varSeg = this->findVariantSegment(startEdge, alignmentsOf(startEdge), 
+											  loopedEdges);
+		if (res.varSeg.startEdge && res.varSeg.endEdge &&
+			res.varSeg.startEdge != _graph.complementEdge(res.varSeg.endEdge))
 		{
-			auto revSeg = 
-				this->findVariantSegment(_graph.complementEdge(varSeg.endEdge), 
-										 alnIndex[_graph.complementEdge(varSeg.endEdge)], 
-										 loopedEdges);
-			if (revSeg.endEdge == _graph.complementEdge(varSeg.startEdge))
-			{
-				foundVariants.push_back(varSeg);
-				usedEdges.insert(revSeg.startEdge);
-			}
+			GraphEdge* revStart = _graph.complementEdge(res.varSeg.endEdge);
+			res.revSeg = this->findVariantSegment(revStart, alignmentsOf(revStart), 
+												  loopedEdges);
+			res.valid = (res.revSeg.endEdge == 
+						 _graph.complementEdge(res.varSeg.startEdge));
 		}
+	};
+	processInParallel(candIds, searchRoundabout, 
+					  Parameters::get().numThreads, false);
+
+	//Selection phase (sequential, original order)
+	std::unordered_set<GraphEdge*> usedEdges;
+	std::vector<VariantPaths> foundVariants;
+	for (size_t i = 0; i < candidates.size(); ++i)
+	{
+		GraphEdge* startEdge = candidates[i];
+		if (usedEdges.count(startEdge)) continue;
+		if (!results[i].valid) continue;
+		foundVariants.push_back(results[i].varSeg);
+		usedEdges.insert(results[i].revSeg.startEdge);
 	}
 
 	int foundNew = 0;
@@ -868,9 +905,11 @@ namespace
 		GraphPath refPath;
 	};
 
+	//Read-only with respect to the graph (topology, edge lengths, loops),
+	//so it can be called concurrently for different start edges.
 	Superbubble isRightSuperbubble(GraphEdge* startEdge, int maxBubbleLen,
 								   const RepeatGraph& graph, 
-								   const std::unordered_set<GraphEdge*> loopedEdges)
+								   const std::unordered_set<GraphEdge*>& loopedEdges)
 	{
 		//Logger::get().debug() << "\t\tSearching for ref. path";
 		auto refPath = anyPath(startEdge, maxBubbleLen, graph);
@@ -890,7 +929,7 @@ namespace
 			if (!endCand->nodeLeft->isBifurcation()) continue;
 			//if (endCand->nodeLeft->inEdges.size() < 2) continue;
 
-			static DijkstraResult distancesFromSource;
+			thread_local DijkstraResult distancesFromSource;
 			getShortestPathsLen(startEdge, endCand, maxBubbleLen, 
 								distancesFromSource);
 			if (distancesFromSource.failure)
@@ -905,7 +944,7 @@ namespace
 					<< " " << edgeDist.second;
 			}*/
 
-			static DijkstraResult distancesFromSink;
+			thread_local DijkstraResult distancesFromSink;
 			getShortestPathsLen(graph.complementEdge(endCand), 
 								graph.complementEdge(startEdge),
 								maxBubbleLen, distancesFromSink);
@@ -986,17 +1025,13 @@ int HaplotypeResolver::findSuperbubbles()
 		}
 	}
 
-	int foundNew = 0;
-	std::unordered_set<GraphEdge*> usedEdges;
+	//Candidate start edges, in graph iteration order (kept for determinism).
+	//Require at least two alternative paths (not counting loops)
+	//to initiate the bubble. No such requirement for the bubble end though
+	std::vector<GraphEdge*> candidates;
 	for (auto& startEdge : _graph.iterEdges())
 	{
 		if (loopedEdges.count(startEdge)) continue;
-		if (usedEdges.count(startEdge)) continue;
-		//if (startEdge->nodeRight->outEdges.size() < 2) continue;
-		//if (!startEdge->nodeRight->isBifurcation()) continue;
-		
-		//require at least two alternative paths (not counting loops)
-		//to initiate the bubble. No such requirement for the bubble end though
 		int numIn = 0;
 		int numOut = 0;
 		for (auto& edge : startEdge->nodeRight->inEdges)
@@ -1007,33 +1042,38 @@ int HaplotypeResolver::findSuperbubbles()
 		{
 			if (!loopedEdges.count(edge)) ++numOut;
 		}
-		//if (numOut < 2) continue;
-		//Logger::get().debug() << "\tChecking start: " << startEdge->edgeId.signedId();
 		if (numOut < 2 || numIn > 1) continue;
+		candidates.push_back(startEdge);
+	}
 
-		//if (startEdge->nodeRight->inEdges.size() > 1 ||
-		//	startEdge->nodeRight->outEdges.size() < 2) continue;
+	//Search phase (parallel): the search only reads graph topology,
+	//and linking edges / marking haplotypes below does not change it,
+	//so all candidates can be searched independently.
+	std::vector<Superbubble> bubbles(candidates.size());
+	std::vector<size_t> candIds;
+	for (size_t i = 0; i < candidates.size(); ++i) candIds.push_back(i);
+	std::function<void(const size_t&)> searchBubble = 
+	[this, &candidates, &bubbles, &loopedEdges, MAX_BUBBLE_LEN](const size_t& i)
+	{
+		bubbles[i] = isRightSuperbubble(candidates[i], MAX_BUBBLE_LEN,
+										_graph, loopedEdges);
+	};
+	processInParallel(candIds, searchBubble, 
+					  Parameters::get().numThreads, false);
 
-		//finding superbubble in one direction
-		auto fwdBubble = isRightSuperbubble(startEdge, MAX_BUBBLE_LEN,
-											_graph, loopedEdges);
+	//Apply phase (sequential, original order)
+	int foundNew = 0;
+	std::unordered_set<GraphEdge*> usedEdges;
+	for (size_t i = 0; i < candidates.size(); ++i)
+	{
+		GraphEdge* startEdge = candidates[i];
+		if (usedEdges.count(startEdge)) continue;
+		auto& fwdBubble = bubbles[i];
 		if (!fwdBubble.end || startEdge == fwdBubble.end ||
 			startEdge == _graph.complementEdge(fwdBubble.end)) continue;
 
 		//prohibit complex loops to be called as superbubbles
 		if (startEdge->nodeRight == fwdBubble.end->nodeLeft) continue;
-
-		//in the opposite direction, both directions must agree
-		/*auto revBubble = isRightSuperbubble(_graph.complementEdge(fwdBubble.end),
-											MAX_BUBBLE_LEN, _graph, loopedEdges);
-		if (!revBubble.end || 
-			startEdge != _graph.complementEdge(revBubble.end))
-		{
-			Logger::get().warning() << "Direction inconsistency! "
-				<< startEdge->edgeId.signedId() << " " 
-				<< fwdBubble.end->edgeId.signedId();
-			continue;
-		}*/
 
 		//superbubble found!
 		//Logger::get().debug() << "\t\tFound superbubble!";
