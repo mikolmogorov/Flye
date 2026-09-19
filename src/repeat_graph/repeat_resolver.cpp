@@ -95,14 +95,19 @@ int RepeatResolver::resolveConnections(const std::vector<Connection>& connection
 	std::unordered_set<FastaRecord::Id> usedEdges;
 	std::vector<Connection> uniqueConnections;
 	int unresolvedLinks = 0;
-	for (auto lemonAsm : lemonToAsm)
+	//visit matched pairs in a fixed (node id) order: which side of a pair
+	//is seen first decides the orientation of the resolved path
+	std::vector<int> lemonNodeIds;
+	for (auto& lemonAsm : lemonToAsm) lemonNodeIds.push_back(lemonAsm.first);
+	std::sort(lemonNodeIds.begin(), lemonNodeIds.end());
+	for (int lemonId : lemonNodeIds)
 	{
-		auto mateNode = matcher.mate(graph.nodeFromId(lemonAsm.first));
+		auto mateNode = matcher.mate(graph.nodeFromId(lemonId));
 		if (mateNode == lemon::INVALID) continue;
 
-		FastaRecord::Id leftId = lemonAsm.second;
+		FastaRecord::Id leftId = lemonToAsm[lemonId];
 		FastaRecord::Id rightId = lemonToAsm[graph.id(mateNode)];
-		int support = edgeWeights[getEdge(graph.nodeFromId(lemonAsm.first), 
+		int support = edgeWeights[getEdge(graph.nodeFromId(lemonId), 
 										  mateNode)];
 
 		if (usedEdges.count(leftId)) continue;

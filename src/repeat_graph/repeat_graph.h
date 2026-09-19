@@ -95,6 +95,31 @@ struct EdgeSequence
 
 
 struct GraphNode;
+struct GraphEdge;
+
+//Hash GraphNode* / GraphEdge* by their ids instead of their addresses, so
+//that the iteration order of unordered containers keyed by graph pointers
+//does not depend on memory layout (ASLR, allocation timing) and two runs
+//with the same input visit nodes and edges in the same order.
+namespace std
+{
+	template <> struct hash<GraphNode*>
+	{
+		size_t operator()(GraphNode* node) const noexcept;
+	};
+	template <> struct hash<const GraphNode*>
+	{
+		size_t operator()(const GraphNode* node) const noexcept;
+	};
+	template <> struct hash<GraphEdge*>
+	{
+		size_t operator()(GraphEdge* edge) const noexcept;
+	};
+	template <> struct hash<const GraphEdge*>
+	{
+		size_t operator()(const GraphEdge* edge) const noexcept;
+	};
+}
 
 struct GraphEdge
 {
@@ -237,6 +262,23 @@ struct GraphNode
 	std::vector<GraphEdge*> outEdges;
 	size_t nodeId;
 };
+
+inline size_t std::hash<GraphNode*>::operator()(GraphNode* node) const noexcept
+{
+	return node ? std::hash<size_t>()(node->nodeId) : 0;
+}
+inline size_t std::hash<const GraphNode*>::operator()(const GraphNode* node) const noexcept
+{
+	return node ? std::hash<size_t>()(node->nodeId) : 0;
+}
+inline size_t std::hash<GraphEdge*>::operator()(GraphEdge* edge) const noexcept
+{
+	return edge ? edge->edgeId.hash() : 0;
+}
+inline size_t std::hash<const GraphEdge*>::operator()(const GraphEdge* edge) const noexcept
+{
+	return edge ? edge->edgeId.hash() : 0;
+}
 
 typedef std::vector<GraphEdge*> GraphPath;
 

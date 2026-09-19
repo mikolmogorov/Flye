@@ -208,9 +208,14 @@ void ReadAligner::alignReads()
 	int64_t alignedLength = 0;
 	OvlpDivStats divergenceStats;
 
+	std::unordered_map<FastaRecord::Id, size_t> queryIndex;
+	for (size_t i = 0; i < allQueries.size(); ++i) queryIndex[allQueries[i]] = i;
+	std::vector<std::vector<GraphAlignment>> perQueryAlignments(allQueries.size());
+
 	std::function<void(const FastaRecord::Id&)> alignRead = 
 	[this, &indexMutex, &numAligned, &readsOverlaps,
-		&idToSegment, &alignedLength, &alignedInFull, &divergenceStats] 
+		&idToSegment, &alignedLength, &alignedInFull, &divergenceStats,
+		&queryIndex, &perQueryAlignments] 
 	(const FastaRecord::Id& seqId)
 	{
 		auto overlaps = readsOverlaps.quickSeqOverlaps(seqId);
@@ -267,22 +272,37 @@ void ReadAligner::alignReads()
 		if (goodChains.size() == 1) ++alignedInFull;
 		for (auto& chain : goodChains) 
 		{
-			chain.shrink_to_fit();
-			_readAlignments.push_back(chain);
 			alignedLength += chain.back().overlap.curEnd - 
 							 chain.front().overlap.curBegin;
+		}
+		indexMutex.unlock();
+		/////
+
+		//Store per query; the results are concatenated in query order
+		//after the parallel phase so that _readAlignments does not depend
+		//on which thread finished first.
+		auto& slot = perQueryAlignments[queryIndex.at(seqId)];
+		for (auto& chain : goodChains) 
+		{
+			chain.shrink_to_fit();
+			slot.push_back(std::move(chain));
 		}
 		for (auto& chain : complChains)
 		{
 			chain.shrink_to_fit();
-			_readAlignments.push_back(chain);
+			slot.push_back(std::move(chain));
 		}
-		indexMutex.unlock();
-		/////
 	};
 
 	processInParallel(allQueries, alignRead, 
 					  Parameters::get().numThreads, true);
+
+	for (auto& slot : perQueryAlignments)
+	{
+		for (auto& chain : slot) _readAlignments.push_back(std::move(chain));
+		slot.clear();
+		slot.shrink_to_fit();
+	}
 
 	Logger::get().debug() << "Total reads : " << allQueries.size();
 	Logger::get().debug() << "Read with aligned parts : " << numAligned;

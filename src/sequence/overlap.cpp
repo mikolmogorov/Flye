@@ -594,6 +594,9 @@ void OverlapContainer::ensureTransitivity(bool onlyMaxExt)
 		allSeqs.push_back(seqIt.first);
 		allSeqs.push_back(seqIt.first.rc());
 	}
+	//the concurrent hash table iterates in an order that depends on
+	//insertion timing; process sequences in id order instead
+	std::sort(allSeqs.begin(), allSeqs.end());
 
 	int totalOverlaps = 0;
 	for (const auto& seq : allSeqs)
@@ -917,6 +920,9 @@ void OverlapContainer::buildIntervalTree()
 		allSeqs.push_back(seqIt.first);
 		allSeqs.push_back(seqIt.first.rc());
 	}
+	//the concurrent hash table iterates in an order that depends on
+	//insertion timing; process sequences in id order instead
+	std::sort(allSeqs.begin(), allSeqs.end());
 
 	for (const auto& seq : allSeqs)
 	{
