@@ -166,7 +166,15 @@ void removeContainedDisjointigs(std::vector<FastaRecord>& disjointigs,
 							 (std::max(ovlp.extBegin, ovlp.extLen - ovlp.extEnd) < FLANK);
 			if (contained)
 			{
-				FastaRecord::Id contId = ovlp.curLen < ovlp.extLen ? ovlp.curId : ovlp.extId;
+				// Both directions (and both strands) of an overlap are visited.
+				// Equal lengths must choose the same loser in every visit,
+				// otherwise two equivalent disjointigs delete each other.
+				auto curId = ovlp.curId.strand() ? ovlp.curId : ovlp.curId.rc();
+				auto extId = ovlp.extId.strand() ? ovlp.extId : ovlp.extId.rc();
+				if (curId == extId) continue;
+				FastaRecord::Id contId = ovlp.curLen != ovlp.extLen ?
+					(ovlp.curLen < ovlp.extLen ? curId : extId) :
+					(curId < extId ? extId : curId);
 				containedDisj.insert(disjSequences.seqName(contId).substr(1));
 			}
 		}
