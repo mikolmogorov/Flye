@@ -164,8 +164,11 @@ int MultiplicityInferer::removeUnsupportedEdges(bool onlyTips)
 	{
 		if (!path.id.strand()) continue;
 
-		//check if it's a tip
-		if (onlyTips && !path.path.back()->isRightTerminal()) continue;
+		// We visit only the positive-ID representative of each strand pair.
+		// Its terminal end may be on either side; edge IDs must not decide
+		// whether a low-coverage tip survives.
+		if (onlyTips && !path.path.back()->isRightTerminal() &&
+			!_graph.complementEdge(path.path.front())->isRightTerminal()) continue;
 
 		if (path.meanCoverage < coverageThreshold)
 		{
@@ -590,5 +593,4 @@ void MultiplicityInferer::trimTipsIteration(int& outShort, int& outLong)
 	outShort = shortClipped;
 	outLong = longClipped;
 }
-
 
