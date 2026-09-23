@@ -402,6 +402,13 @@ public:
 	//readId is simply referencing to the computed overlaps.
 	const std::vector<OverlapRange>& lazySeqOverlaps(FastaRecord::Id readId);
 
+	// Reuse complete cached evidence without creating a cache entry for a
+	// seed that may be rejected. Returns false when no complete list exists.
+	bool copyCachedSeqOverlaps(FastaRecord::Id readId, std::vector<OverlapRange>& overlaps);
+	// Publish complete forward-strand evidence after seed screening. A
+	// concurrent publisher wins without replacing its immutable vectors.
+	void cacheForwardOverlaps(FastaRecord::Id readId, std::vector<OverlapRange> overlaps);
+
 	//Checks if read has self-overlaps (for chimera detection)
 	bool hasSelfOverlaps(FastaRecord::Id seqId);
 

@@ -536,30 +536,26 @@ std::vector<OverlapRange>
 									  _divergenceStats, maxOverlaps);
 }
 
-const std::vector<OverlapRange>&
-	OverlapContainer::lazySeqOverlaps(FastaRecord::Id readId)
+bool OverlapContainer::copyCachedSeqOverlaps(FastaRecord::Id readId,
+										   std::vector<OverlapRange>& overlaps)
 {
-	bool flipped = !readId.strand();
-	if (flipped) readId = readId.rc();
 	IndexVecWrapper wrapper;
+	bool flipped = !readId.strand();
+	auto cacheId = flipped ? readId.rc() : readId;
+	if (!_overlapIndex.find(cacheId, wrapper) || !wrapper.cached) return false;
+	overlaps = flipped ? *wrapper.revOverlaps : *wrapper.fwdOverlaps;
+	return true;
+}
 
-	//upsert creates default value if it does not exist
-	_overlapIndex.upsert(readId, 	
+void OverlapContainer::cacheForwardOverlaps(FastaRecord::Id readId,
+										  std::vector<OverlapRange> overlaps)
+{
+	if (!readId.strand()) throw std::runtime_error("Expected forward-strand overlaps");
+	IndexVecWrapper wrapper;
+	_overlapIndex.upsert(readId,
 		[&wrapper](IndexVecWrapper& val)
 			{wrapper = val;});
-	if (wrapper.cached)
-	{
-		return !flipped ? *wrapper.fwdOverlaps : *wrapper.revOverlaps;
-	}
-
-	//otherwise, need to compute overlaps.
-	//do it for forward strand to be distinct
-	//bool suggestChimeric;
-	const bool DEFAULT_LOCAL = false;
-	const FastaRecord& record = _queryContainer.getRecord(readId);
-	auto overlaps = _ovlpDetect.getSeqOverlaps(record, DEFAULT_LOCAL, 
-											   _divergenceStats,
-											   _ovlpDetect._maxCurOverlaps);
+	if (wrapper.cached) return;
 	overlaps.shrink_to_fit();
 
 	std::vector<OverlapRange> revOverlaps;
@@ -567,7 +563,7 @@ const std::vector<OverlapRange>&
 	for (const auto& ovlp : overlaps) revOverlaps.push_back(ovlp.complement());
 
 	_overlapIndex.update_fn(readId,
-		[&wrapper, &overlaps, &revOverlaps, this]
+		[&overlaps, &revOverlaps, this]
 		(IndexVecWrapper& val)
 		{
 			if (!val.cached)
@@ -578,9 +574,27 @@ const std::vector<OverlapRange>&
 				//val.suggestChimeric = suggestChimeric;
 				val.cached = true;
 			}
-			wrapper = val;
 		});
+}
 
+const std::vector<OverlapRange>&
+	OverlapContainer::lazySeqOverlaps(FastaRecord::Id readId)
+{
+	bool flipped = !readId.strand();
+	if (flipped) readId = readId.rc();
+	IndexVecWrapper wrapper;
+	_overlapIndex.upsert(readId,
+		[&wrapper](IndexVecWrapper& val)
+			{wrapper = val;});
+	if (!wrapper.cached)
+	{
+		const FastaRecord& record = _queryContainer.getRecord(readId);
+		auto overlaps = _ovlpDetect.getSeqOverlaps(record, /*force local*/ false,
+												   _divergenceStats,
+												   _ovlpDetect._maxCurOverlaps);
+		this->cacheForwardOverlaps(readId, std::move(overlaps));
+		wrapper = _overlapIndex.find(readId);
+	}
 	return !flipped ? *wrapper.fwdOverlaps : *wrapper.revOverlaps;
 }
 
