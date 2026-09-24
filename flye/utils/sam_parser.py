@@ -132,6 +132,7 @@ class SynchonizedChunkManager(object):
     def __init__(self, reference_fasta, multiproc_manager, chunk_size=None):
         #prepare list of chunks to read
         self.fetch_list = []
+        self.whole_contig = []
         self.chunk_size = chunk_size
 
         #will be shared between processes
@@ -154,6 +155,7 @@ class SynchonizedChunkManager(object):
                 if ctg_len - reg_end < chunk_size:
                     reg_end = ctg_len
                 self.fetch_list.append(ContigRegion(ctg_id, reg_start, reg_end))
+                self.whole_contig.append(reg_start == 0 and reg_end == ctg_len)
                 #logger.debug("Region: {0} {1} {2}".format(ctg_id, reg_start, reg_end))
 
         if len(self.fetch_list) == 0:
@@ -161,6 +163,46 @@ class SynchonizedChunkManager(object):
 
     def is_done(self):
         return self.shared_eof.value
+
+    def get_chunk_batch(self, max_batch, max_bases=None):
+        """
+        Returns up to max_batch regions, stopping early once their combined
+        length would exceed max_bases. Only whole-contig regions are
+        batched together; a contig split into multiple chunks is returned
+        alone, since a read may overlap two of its chunks.
+
+        The bases budget prevents one worker from receiving a disproportionate
+        amount of sequence when contigs are ordered longest-first.
+        """
+        batch = []
+        batch_bases = 0
+        while len(batch) < max_batch:
+            if self.shared_lock:
+                self.shared_lock.acquire()
+            try:
+                if self.shared_eof.value:
+                    break
+                job_id = self.shared_num_jobs.value
+                region = self.fetch_list[job_id]
+                whole_contig = self.whole_contig[job_id]
+                if batch and not whole_contig:
+                    break
+                #always take at least one region, however long it is
+                region_bases = region.end - region.start
+                if (batch and max_bases is not None and
+                        batch_bases + region_bases > max_bases):
+                    break
+                self.shared_num_jobs.value = job_id + 1
+                if self.shared_num_jobs.value == len(self.fetch_list):
+                    self.shared_eof.value = True
+                batch.append(region)
+                batch_bases += region_bases
+                if not whole_contig:
+                    break
+            finally:
+                if self.shared_lock:
+                    self.shared_lock.release()
+        return batch
 
     def get_chunk(self):
         job_id = None
@@ -364,6 +406,33 @@ class SynchronizedSamReader(object):
 
         return get_median(all_cov_pos) if all_cov_pos else 0
 
+    def get_alignments_batch(self, regions):
+        """
+        Reads multiple regions in a single samtools call
+        """
+        if not regions:
+            return {}
+
+        args = " ".join("'{0}:{1}-{2}'".format(_STR(_BYTES(r.ctg_id)), r.start, r.end)
+                        for r in regions)
+        aln_file = subprocess.Popen("{0} view {1} {2}"
+                                    .format(SAMTOOLS_BIN, self.aln_path, args),
+                                    shell=True, stdout=subprocess.PIPE).stdout
+
+        by_contig = defaultdict(list)
+        for line in aln_file:
+            #reference name is the 3rd column
+            fields = line.split(b"\t", 4)
+            if len(fields) < 4:
+                continue
+            by_contig[fields[2]].append(line)
+
+        out = {}
+        for r in regions:
+            key = _BYTES(r.ctg_id)
+            out[r.ctg_id] = self._parse_alignment_lines(by_contig.get(key, []), key)
+        return out
+
     def get_alignments(self, region_id, region_start=None, region_end=None):
         parsed_contig = _BYTES(region_id)
         contig_str = self.ref_fasta[parsed_contig]
@@ -381,6 +450,14 @@ class SynchronizedSamReader(object):
         chunk_buffer = []
         for line in aln_file:
             chunk_buffer.append(line)
+
+        return self._parse_alignment_lines(chunk_buffer, parsed_contig)
+
+    def _parse_alignment_lines(self, chunk_buffer, parsed_contig):
+        """
+        Parses SAM records into alignments
+        """
+        contig_str = self.ref_fasta[parsed_contig]
 
         #shuffle alignments so that they uniformly distributed. Needed for
         #max_coverage subsampling. Using the same seed for determinism
