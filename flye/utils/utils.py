@@ -4,12 +4,50 @@
 
 from __future__ import absolute_import
 import os
+import re
 import signal
+import subprocess
 import multiprocessing
 import logging
 
 
 logger = logging.getLogger()
+
+
+def htslib_version(binary):
+    """
+    Returns the htslib version samtools is linked against, as a tuple, or None
+
+    `samtools --version` prints its own version first and the htslib it was
+    built against on the next line. The two are released together, but a
+    binary can be linked against a different htslib, and the behaviour that
+    matters for --write-index is htslib's.
+    """
+    try:
+        out = subprocess.check_output([binary, "--version"],
+                                      stderr=subprocess.DEVNULL).decode()
+        for line in out.splitlines():
+            if "htslib" in line.lower():
+                nums = re.findall(r"\d+", line)
+                return tuple(int(x) for x in nums[:2])
+        return None
+    except (subprocess.CalledProcessError, OSError, IndexError, ValueError):
+        return None
+
+
+def resolve_samtools(min_version=(1, 12)):
+    """Prefer a samtools on PATH over the vendored one, when it is new enough.
+
+    htslib 1.12+ supports the write-index path used during polishing. Fall back
+    to the vendored binary when PATH has nothing suitable.
+    """
+    for cand in ("samtools", "flye-samtools"):
+        if not which(cand):
+            continue
+        ver = htslib_version(cand)
+        if ver is not None and ver >= min_version:
+            return cand
+    return "flye-samtools"
 
 
 def which(program):

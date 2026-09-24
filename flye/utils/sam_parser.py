@@ -15,6 +15,7 @@ import sys
 from collections import namedtuple, defaultdict
 import subprocess
 import logging
+from flye.utils.utils import resolve_samtools
 import multiprocessing
 import ctypes
 import time
@@ -40,7 +41,7 @@ from flye.utils.utils import get_median
 
 logger = logging.getLogger()
 
-SAMTOOLS_BIN = "flye-samtools"
+SAMTOOLS_BIN = resolve_samtools()
 Alignment = namedtuple("Alignment", ["qry_id", "trg_id", "qry_start", "qry_end",
                                      "qry_sign", "qry_len", "trg_start",
                                      "trg_end", "trg_sign", "trg_len",
