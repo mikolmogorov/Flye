@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <memory>
 #include <vector>
 #include <iostream>
 #include <cstring>
@@ -58,6 +59,10 @@ private:
 	std::atomic<uint8_t>*			_flatCounter;
 	//std::vector<std::atomic<char>>  _flatCounter;
 	cuckoohash_map<Kmer, size_t> 	_hashCounter;
+	//Set at the end of count(), when _hashCounter stops changing. Holds every
+	//lock of _hashCounter, so getFreq() can read it without taking locks.
+	//Released by clear(); declared after _hashCounter so it is destroyed first.
+	std::unique_ptr<cuckoohash_map<Kmer, size_t>::locked_table> _frozenHash;
 	KmerDistribution _kmerDistribution;
 
 	std::atomic<size_t> _numKmers;
