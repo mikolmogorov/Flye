@@ -3,11 +3,18 @@
 //Released under the BSD license (see LICENSE file)
 
 #include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "homo_polisher.h"
 #include "../common/matrix.h"
-
+#include "../polishing/bubble.h"
+#include "../polishing/subs_matrix.h"
 
 namespace
 {
@@ -16,8 +23,10 @@ namespace
 						   const SubstitutionMatrix& subsMat,
 						   std::string& outOne, std::string& outTwo)
 	{
-		Matrix<AlnScoreType> scoreMat(seqOne.length() + 1, seqTwo.length() + 1);
-		Matrix<char> backtrackMat(seqOne.length() + 1, seqTwo.length() + 1);
+		thread_local Matrix<AlnScoreType> scoreMat;
+		thread_local Matrix<char> backtrackMat;
+		scoreMat.resize(seqOne.length() + 1, seqTwo.length() + 1);
+		backtrackMat.resize(seqOne.length() + 1, seqTwo.length() + 1);
 
 		scoreMat.at(0, 0) = 0;
 		backtrackMat.at(0, 0) = 0;
@@ -93,8 +102,8 @@ namespace
 		}
 		std::reverse(outOne.begin(), outOne.end());
 		std::reverse(outTwo.begin(), outTwo.end());
-		outOne += "$";
-		outTwo += "$";
+		outOne += '$';
+		outTwo += '$';
 	}
 
 	//Splits aligned strings into homopolymer runs (wrt to candAln)
