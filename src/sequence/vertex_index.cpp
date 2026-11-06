@@ -430,12 +430,54 @@ void KmerCounter::count(bool useFlatCounter)
 	Logger::get().debug() << "Updating k-mer histogram";
 	if (_useFlatCounter)
 	{
-		for (size_t kmerId = 0; kmerId < COUNTER_LEN * 2; ++kmerId)
+		const size_t numChunks = 256;
+		std::vector<size_t> chunks(numChunks);
+		for (size_t i = 0; i < numChunks; ++i) chunks[i] = i;
+
+		std::mutex histMutex;
+		size_t globalSmallHist[16] = {0};
+		const uint8_t* rawFlat = reinterpret_cast<const uint8_t*>(_flatCounter);
+
+		std::function<void(const size_t&)> scanChunk =
+		[rawFlat, numChunks, &histMutex, &globalSmallHist](const size_t& chunkId)
 		{
-			Kmer kmer(kmerId);
-			size_t freq = this->getFreq(kmer);
-			if (freq > 0) _kmerDistribution[freq] += 1;
-			//if (kmerId % 1000000 == 0) Logger::get().debug() << kmerId << " " << freq;
+			const size_t startByte = (COUNTER_LEN * chunkId) / numChunks;
+			const size_t endByte = (COUNTER_LEN * (chunkId + 1)) / numChunks;
+			size_t localHist[16] = {0};
+
+			size_t i = startByte;
+			for (; i + 8 <= endByte; i += 8)
+			{
+				uint64_t word;
+				std::memcpy(&word, rawFlat + i, sizeof(uint64_t));
+				if (word == 0) continue;
+				for (int b = 0; b < 16; ++b)
+				{
+					++localHist[(word >> (b * 4)) & 0xF];
+				}
+			}
+			for (; i < endByte; ++i)
+			{
+				uint8_t byte = rawFlat[i];
+				if (byte == 0) continue;
+				++localHist[byte & 0xF];
+				++localHist[byte >> 4];
+			}
+
+			histMutex.lock();
+			for (int f = 1; f < 16; ++f) globalSmallHist[f] += localHist[f];
+			histMutex.unlock();
+		};
+		processInParallel(chunks, scanChunk, Parameters::get().numThreads, false);
+
+		for (const auto& kv : _hashCounter.lock_table())
+		{
+			--globalSmallHist[15];
+			_kmerDistribution[15 + kv.second] += 1;
+		}
+		for (size_t f = 1; f < 16; ++f)
+		{
+			if (globalSmallHist[f] > 0) _kmerDistribution[f] += globalSmallHist[f];
 		}
 	}
 	else
