@@ -224,6 +224,13 @@ public:
 						  _seqContainer);
 	}
 
+	IterHelper iterKmerPosCanonical(Kmer stdKmer, bool revComp) const
+	{
+		ReadVector rv;
+		_kmerIndex.find(stdKmer, rv);
+		return IterHelper(rv, revComp, _seqContainer);
+	}
+
 	//__attribute__((always_inline))
 	/*bool isSolid(Kmer kmer) const
 	{
@@ -235,6 +242,11 @@ public:
 	{
 		kmer.standardForm();
 		return _repetitiveKmers.contains(kmer);
+	}
+
+	bool isRepetitiveCanonical(Kmer stdKmer) const
+	{
+		return _repetitiveKmers.contains(stdKmer);
 	}
 	
 	size_t kmerFreq(Kmer kmer) const
