@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <thread>
+#include <new>
+#include <sys/mman.h>
 
 #include "vertex_index.h"
 #include "../common/logger.h"
@@ -216,14 +218,34 @@ std::vector<VertexIndex::KmerFreq>
 	std::vector<KmerFreq> topKmers;
 	topKmers.reserve(_seqContainer.seqLen(seqId));
 
+	//Collect the read's k-mers first, so the random flat-counter lookups can
+	//be prefetched ahead and several cache misses stay in flight at once.
+	//getFreq() and localFreq still see the k-mers in the original order.
+	thread_local std::vector<KmerPosition> readKmers;
+	thread_local std::vector<Kmer> stdKmers;
+	readKmers.clear();
+	stdKmers.clear();
 	for (const auto& kmerPos : IterKmers(_seqContainer.getSeq(seqId)))
 	{
 		auto stdKmer = kmerPos.kmer;
 		stdKmer.standardForm();
-		size_t freq = _kmerCounter.getFreq(stdKmer);
+		readKmers.push_back(kmerPos);
+		stdKmers.push_back(stdKmer);
+	}
 
-		++localFreq[stdKmer];
-		topKmers.push_back({kmerPos.kmer, kmerPos.position, freq});
+	const size_t PREFETCH_AHEAD = 16;
+	const size_t numKmers = stdKmers.size();
+	for (size_t i = 0; i < std::min(PREFETCH_AHEAD, numKmers); ++i)
+	{
+		_kmerCounter.prefetch(stdKmers[i]);
+	}
+	for (size_t i = 0; i < numKmers; ++i)
+	{
+		if (i + PREFETCH_AHEAD < numKmers) _kmerCounter.prefetch(stdKmers[i + PREFETCH_AHEAD]);
+		size_t freq = _kmerCounter.getFreq(stdKmers[i]);
+
+		++localFreq[stdKmers[i]];
+		topKmers.push_back({readKmers[i].kmer, readKmers[i].position, freq});
 	}
 
 	if (topKmers.empty()) return {};
@@ -406,8 +428,16 @@ void KmerCounter::count(bool useFlatCounter)
 	static const size_t COUNTER_LEN = std::pow(4, Parameters::get().kmerSize) / 2;
 	if (useFlatCounter)
 	{
-		_flatCounter = new std::atomic<uint8_t>[COUNTER_LEN];
-		std::memset(_flatCounter, 0, COUNTER_LEN);
+		//2 MiB-aligned and marked for transparent huge pages: lookups into this
+		//8 GB array are random, and on 4 KiB pages nearly every one also needs a
+		//page-table walk. Freed with free() in clear() and ~KmerCounter().
+		const size_t HUGE_PAGE = 2 * 1024 * 1024;
+		const size_t allocLen = (COUNTER_LEN + HUGE_PAGE - 1) / HUGE_PAGE * HUGE_PAGE;
+		void* flatMem = nullptr;
+		if (posix_memalign(&flatMem, HUGE_PAGE, allocLen) != 0) throw std::bad_alloc();
+		madvise(flatMem, allocLen, MADV_HUGEPAGE);
+		std::memset(flatMem, 0, allocLen);
+		_flatCounter = static_cast<std::atomic<uint8_t>*>(flatMem);
 	}
  
 	if (_outputProgress) Logger::get().info() << "Counting k-mers:";
@@ -560,7 +590,11 @@ size_t KmerCounter::getFreq(Kmer kmer) const
 	{
 		size_t arrayPos = kmer.numRepr() / 2;
 		bool highBits = kmer.numRepr() % 2;
-		uint8_t count = highBits ? (_flatCounter[arrayPos]) >> 4 : (_flatCounter[arrayPos] & 15);
+		//Counting threads have been joined, so a relaxed load returns the same
+		//byte. The default seq_cst load is a load-acquire (ldarb) on Arm, and
+		//no ordering is needed here (no measurable speed change on its own).
+		uint8_t bits = _flatCounter[arrayPos].load(std::memory_order_relaxed);
+		uint8_t count = highBits ? (bits >> 4) : (bits & 15);
 		if (count < 15)
 		{
 			return recordFreq(kmer, count);
@@ -597,7 +631,7 @@ void KmerCounter::clear()
 	_hashCounter.reserve(0);
 	if (_flatCounter)
 	{
-		delete[] _flatCounter;
+		free(_flatCounter);
 		_flatCounter = nullptr;
 	}
 }

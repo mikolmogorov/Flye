@@ -12,6 +12,7 @@
 #include <vector>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 
 #include <cuckoohash_map.hh>
 
@@ -35,7 +36,7 @@ public:
 	{
 		if (_flatCounter) 
 		{
-			delete[] _flatCounter;
+			free(_flatCounter);	//allocated with posix_memalign in count()
 			_flatCounter = nullptr;
 		}
 	}
@@ -47,6 +48,13 @@ public:
 
 	void   count(bool useFlatCounter);
 	size_t getFreq(Kmer kmer) const;
+
+	//Starts loading the flat counter byte of a standard-form k-mer so a
+	//later getFreq() finds it in cache. Does not change any result.
+	void prefetch(Kmer kmer) const
+	{
+		if (_useFlatCounter) __builtin_prefetch(&_flatCounter[kmer.numRepr() / 2], 0, 0);
+	}
 	size_t getKmerNum() const;
 	void clear();
 	void setOutputProgress(bool progress) {_outputProgress = progress;}
