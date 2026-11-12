@@ -4,12 +4,20 @@
 
 #pragma once
 
-#include <unordered_map>
-#include <memory>
+#include <cstddef>
+#include <cstdint>
+#if defined(_MSC_VER)
+#include <cstdlib>
+#endif
+#include <functional>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include <deque>
 
-#include "sequence_container.h"
 #include "../common/config.h"
+#include "../sequence/sequence.h"
 
 static_assert(sizeof(size_t) == 8, "32-bit architectures are not supported");
 
@@ -36,18 +44,27 @@ public:
 		}
 	}
 
-	Kmer reverseComplement()
+	static KmerRepr bswap64(KmerRepr v)
 	{
-		KmerRepr tmpRepr = _representation;
+#if defined(__GNUC__) || defined(__clang__)
+		return __builtin_bswap64(v);
+#elif defined(_MSC_VER)
+		return _byteswap_uint64(v);
+#else
+		v = ((v >> 8) & 0x00FF00FF00FF00FFULL) | ((v & 0x00FF00FF00FF00FFULL) << 8);
+		v = ((v >> 16) & 0x0000FFFF0000FFFFULL) | ((v & 0x0000FFFF0000FFFFULL) << 16);
+		return (v >> 32) | (v << 32);
+#endif
+	}
+
+	Kmer reverseComplement() const
+	{
+		KmerRepr v = ~_representation;
+		v = ((v >> 2) & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
+		v = ((v >> 4) & 0x0F0F0F0F0F0F0F0FULL) | ((v & 0x0F0F0F0F0F0F0F0FULL) << 4);
+		v = bswap64(v);
 		Kmer newKmer;
-
-		for (unsigned int i = 0; i < Parameters::get().kmerSize; ++i)
-		{
-			newKmer._representation <<= 2;
-			newKmer._representation += ~tmpRepr & 3;
-			tmpRepr >>= 2;
-		}
-
+		newKmer._representation = v >> (64 - (Parameters::get().kmerSize << 1));
 		return newKmer;
 	}
 
@@ -68,7 +85,7 @@ public:
 		_representation += dnaSymbol;
 
 		KmerRepr kmerSize = Parameters::get().kmerSize;
-		KmerRepr kmerMask = ((KmerRepr)1 << kmerSize * 2) - 1;
+		KmerRepr kmerMask = (kmerSize >= 32) ? ~KmerRepr(0) : (((KmerRepr)1 << (kmerSize * 2)) - 1);
 		_representation &= kmerMask;
 	}
 
