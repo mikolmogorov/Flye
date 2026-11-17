@@ -149,8 +149,8 @@ float getAlignmentCigarKsw(const DnaSequence& trgSeq, size_t trgBegin, size_t tr
 	for (;;)
 	{
 		memset(&ez, 0, sizeof(ksw_extz_t));
-		ksw_extz2_sse(buf.memPool, qryByte.size(), &qryByte[0], 
-					  trgByte.size(), &trgByte[0], NUM_NUCL,
+		ksw_extz2_sse(buf.memPool, qryByte.size(), qryByte.data(),
+					  trgByte.size(), trgByte.data(), NUM_NUCL,
 					  subsMat, gapOpen, gapExtend, bandWidth, Z_DROP, 
 					  END_BONUS, FLAG, &ez);
 		if (!ez.zdropped)
@@ -246,29 +246,39 @@ float getAlignmentErrEdlib(const OverlapRange& ovlp, const DnaSequence& trgSeq,
 	thread_local ThreadMemPool buf;
 	buf.cleanIter();
 
-	auto trgCompressed = homopolymerCompression(trgSeq, ovlp.curBegin, 
-												ovlp.curRange(), useHpc);
-	auto qryCompressed = homopolymerCompression(qrySeq, ovlp.extBegin, 
-												ovlp.extRange(), useHpc);
+	thread_local std::string trgStr;
+	thread_local std::string qryStr;
+	trgStr.clear();
+	qryStr.clear();
+	const int32_t trgLen = ovlp.curRange();
+	const int32_t qryLen = ovlp.extRange();
+	trgStr.reserve(trgLen);
+	qryStr.reserve(qryLen);
+
+	for (int32_t i = 0; i < trgLen; ++i)
+	{
+		char c = trgSeq.at(ovlp.curBegin + i);
+		if (!useHpc || i == 0 || trgStr.back() != c) trgStr.push_back(c);
+	}
+	for (int32_t i = 0; i < qryLen; ++i)
+	{
+		char c = qrySeq.at(ovlp.extBegin + i);
+		if (!useHpc || i == 0 || qryStr.back() != c) qryStr.push_back(c);
+	}
 
 	(void)maxAlnErr;
-	//int bandWidth = std::max(10.0f, maxAlnErr * std::max(ovlp.curRange(), 
-	//													 ovlp.extRange()));
-	//letting edlib find k byt iterating over powers of 2. Seems like
-	//it is in fact a little faster, than having a hard upper limit.
 	auto edlibCfg = edlibNewAlignConfig(-1, EDLIB_MODE_NW, 
 										EDLIB_TASK_DISTANCE, nullptr, 0);
-	auto result = edlibAlign(&qryCompressed.seq.str().c_str()[0], qryCompressed.seq.length(),
-							 &trgCompressed.seq.str().c_str()[0], trgCompressed.seq.length(), 
+	auto result = edlibAlign(qryStr.data(), qryStr.length(),
+							 trgStr.data(), trgStr.length(),
 							 edlibCfg);
-	//Logger::get().debug() << result.editDistance << " " << result.alignmentLength;
-	if (result.editDistance < 0)
+	int editDist = result.editDistance;
+	edlibFreeAlignResult(result);
+	if (editDist < 0)
 	{
 		return 1.0f;
 	}
-	return (float)result.editDistance / std::max(qryCompressed.seq.length(), 
-												 trgCompressed.seq.length());
-	//return (float)result.editDistance / result.alignmentLength;
+	return (float)editDist / std::max(qryStr.length(), trgStr.length());
 }
 
 
