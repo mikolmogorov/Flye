@@ -59,27 +59,34 @@ def shift_gaps(seq_trg, seq_qry):
     """
     Shifts all ambigious query gaps to the right
     """
-    lst_trg, lst_qry = list("$" + seq_trg + "$"), list("$" + seq_qry + "$")
-    is_gap = False
-    gap_start = 0
-    for i in range(len(lst_trg)):
-        if is_gap and lst_qry[i] != "-":
-            is_gap = False
-            swap_left = gap_start - 1
-            swap_right = i - 1
+    if "-" not in seq_qry:
+        return seq_qry
 
-            while (swap_left > 0 and swap_right >= gap_start and
-                   lst_qry[swap_left] == lst_trg[swap_right]):
-                lst_qry[swap_left], lst_qry[swap_right] = \
-                            lst_qry[swap_right], lst_qry[swap_left]
-                swap_left -= 1
-                swap_right -= 1
+    b_trg = seq_trg.encode("ascii")
+    ba_qry = bytearray(seq_qry, "ascii")
+    n = len(ba_qry)
+    pos = 0
 
-        if not is_gap and lst_qry[i] == "-":
-            is_gap = True
-            gap_start = i
+    while True:
+        gap_start = ba_qry.find(45, pos)
+        if gap_start == -1:
+            break
+        gap_end = gap_start + 1
+        while gap_end < n and ba_qry[gap_end] == 45:
+            gap_end += 1
 
-    return "".join(lst_qry[1 : -1])
+        swap_left = gap_start - 1
+        swap_right = gap_end - 1
+        while (swap_left >= 0 and swap_right >= gap_start and
+               ba_qry[swap_left] == b_trg[swap_right]):
+            ba_qry[swap_right] = ba_qry[swap_left]
+            ba_qry[swap_left] = 45
+            swap_left -= 1
+            swap_right -= 1
+
+        pos = gap_end + 1
+
+    return ba_qry.decode("ascii")
 
 
 def get_uniform_alignments(alignments):
