@@ -178,15 +178,16 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 
 	for (const auto& curKmerPos : IterKmers(fastaRec.sequence))
 	{
-		if (_vertexIndex.isRepetitive(curKmerPos.kmer))
+		Kmer stdKmer = curKmerPos.kmer;
+		bool revComp = stdKmer.standardForm();
+		if (_vertexIndex.isRepetitiveCanonical(stdKmer))
 		{
 			curFilteredPos.push_back(curKmerPos.position);
 			continue;
 		}
-		if (!_vertexIndex.kmerFreq(curKmerPos.kmer)) continue;
 
 		//FastaRecord::Id prevSeqId = FastaRecord::ID_NONE;
-		for (const auto& extReadPos : _vertexIndex.iterKmerPos(curKmerPos.kmer))
+		for (const auto& extReadPos : _vertexIndex.iterKmerPosCanonical(stdKmer, revComp))
 		{
 			//no trivial matches
 			if ((extReadPos.readId == fastaRec.id &&
