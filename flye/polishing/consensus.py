@@ -38,21 +38,25 @@ class Profile(object):
 def _thread_worker(aln_reader, chunk_feeder, platform, results_queue, error_queue):
     try:
         while True:
-            ctg_region = chunk_feeder.get_chunk()
-            if ctg_region is None:
+            #fetch regions in batches to amortize BAM header parsing
+            ctg_regions = chunk_feeder.get_chunk_batch(cfg.vals["bam_region_batch"],
+                                                       cfg.vals["bam_region_batch_bases"])
+            if not ctg_regions:
                 break
-            ctg_aln = aln_reader.get_alignments(ctg_region.ctg_id, ctg_region.start,
-                                                ctg_region.end)
-            ctg_id = ctg_region.ctg_id
-            if len(ctg_aln) == 0:
-                continue
+            batch_alns = aln_reader.get_alignments_batch(ctg_regions)
 
-            ctg_aln = aln_reader.trim_and_transpose(ctg_aln, ctg_region.start, ctg_region.end)
-            ctg_aln, _mean_cov = get_uniform_alignments(ctg_aln)
+            for ctg_region in ctg_regions:
+                ctg_aln = batch_alns.get(ctg_region.ctg_id, [])
+                ctg_id = ctg_region.ctg_id
+                if len(ctg_aln) == 0:
+                    continue
 
-            profile, aln_errors = _contig_profile(ctg_aln, platform)
-            sequence = _flatten_profile(profile)
-            results_queue.put((ctg_id, ctg_region.start, sequence, aln_errors))
+                ctg_aln = aln_reader.trim_and_transpose(ctg_aln, ctg_region.start, ctg_region.end)
+                ctg_aln, _mean_cov = get_uniform_alignments(ctg_aln)
+
+                profile, aln_errors = _contig_profile(ctg_aln, platform)
+                sequence = _flatten_profile(profile)
+                results_queue.put((ctg_id, ctg_region.start, sequence, aln_errors))
 
     except Exception as e:
         logger.error("Thread exception")

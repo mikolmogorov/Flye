@@ -61,53 +61,57 @@ def _thread_worker(aln_reader, chunk_feeder, contigs_info, err_mode,
     """
     try:
         while True:
-            ctg_region = chunk_feeder.get_chunk()
-            if ctg_region is None:
+            #fetch regions in batches to amortize BAM header parsing
+            ctg_regions = chunk_feeder.get_chunk_batch(cfg.vals["bam_region_batch"],
+                                                       cfg.vals["bam_region_batch_bases"])
+            if not ctg_regions:
                 break
-            ctg_aln = aln_reader.get_alignments(ctg_region.ctg_id, ctg_region.start,
-                                                ctg_region.end)
-            ctg_id = ctg_region.ctg_id
-            if len(ctg_aln) == 0:
-                continue
-            ref_seq = aln_reader.get_region_sequence(ctg_region.ctg_id, ctg_region.start,
-                                                     ctg_region.end)
+            batch_alns = aln_reader.get_alignments_batch(ctg_regions)
 
-            #since we are working with contig chunks, tranform alignment coorinates
-            ctg_aln = aln_reader.trim_and_transpose(ctg_aln, ctg_region.start, ctg_region.end)
-            ctg_aln, mean_cov = get_uniform_alignments(ctg_aln)
+            for ctg_region in ctg_regions:
+                ctg_aln = batch_alns.get(ctg_region.ctg_id, [])
+                ctg_id = ctg_region.ctg_id
+                if len(ctg_aln) == 0:
+                    continue
+                ref_seq = aln_reader.get_region_sequence(ctg_region.ctg_id, ctg_region.start,
+                                                         ctg_region.end)
 
-            profile, aln_errors = _compute_profile(ctg_aln, ref_seq)
-            partition, num_long_bubbles = _get_partition(profile, err_mode)
-            ctg_bubbles = _get_bubble_seqs(ctg_aln, profile, partition, ctg_id)
+                #since we are working with contig chunks, tranform alignment coorinates
+                ctg_aln = aln_reader.trim_and_transpose(ctg_aln, ctg_region.start, ctg_region.end)
+                ctg_aln, mean_cov = get_uniform_alignments(ctg_aln)
 
-            ##
-            coverage_cap = 0.9 * cfg.vals["max_read_coverage"]
-            if mean_cov > coverage_cap:
-                mean_cov = aln_reader.get_median_depth(ctg_region.ctg_id, ctg_region.start,
-                                                       ctg_region.end)
-            ##
+                profile, aln_errors = _compute_profile(ctg_aln, ref_seq)
+                partition, num_long_bubbles = _get_partition(profile, err_mode)
+                ctg_bubbles = _get_bubble_seqs(ctg_aln, profile, partition, ctg_id)
 
-            ctg_bubbles, num_empty = _postprocess_bubbles(ctg_bubbles)
-            ctg_bubbles, num_long_branch = _split_long_bubbles(ctg_bubbles)
+                ##
+                coverage_cap = 0.9 * cfg.vals["max_read_coverage"]
+                if mean_cov > coverage_cap:
+                    mean_cov = aln_reader.get_median_depth(ctg_region.ctg_id, ctg_region.start,
+                                                           ctg_region.end)
+                ##
 
-            #transform coordinates back
-            for b in ctg_bubbles:
-                b.position += ctg_region.start
+                ctg_bubbles, num_empty = _postprocess_bubbles(ctg_bubbles)
+                ctg_bubbles, num_long_branch = _split_long_bubbles(ctg_bubbles)
 
-            if bubbles_file_lock:
-                bubbles_file_lock.acquire()
+                #transform coordinates back
+                for b in ctg_bubbles:
+                    b.position += ctg_region.start
 
-            with open(bubbles_file, "a") as fout:
-                _output_bubbles(ctg_bubbles, fout)
-            results_queue.put((ctg_id, len(ctg_bubbles), num_long_bubbles,
-                               num_empty, num_long_branch, aln_errors,
-                               mean_cov))
-            
-            if bubbles_file_lock:
-                bubbles_file_lock.release()
+                if bubbles_file_lock:
+                    bubbles_file_lock.acquire()
 
-            del profile
-            del ctg_bubbles
+                with open(bubbles_file, "a") as fout:
+                    _output_bubbles(ctg_bubbles, fout)
+                results_queue.put((ctg_id, len(ctg_bubbles), num_long_bubbles,
+                                   num_empty, num_long_branch, aln_errors,
+                                   mean_cov))
+
+                if bubbles_file_lock:
+                    bubbles_file_lock.release()
+
+                del profile
+                del ctg_bubbles
 
     except Exception as e:
         logger.error("Thread exception")
