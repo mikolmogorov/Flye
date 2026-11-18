@@ -50,14 +50,25 @@ void unionSet(SetNode<T>* node1, SetNode<T>* node2)
 	}
 }
 
+//Groups are returned in the order of their first element in the input,
+//so that the result does not depend on the addresses of the set nodes
+//(iterating an unordered_map keyed by pointers would).
 template <typename T>
-std::unordered_map<SetNode<T>*, std::vector<T>> 
+std::vector<std::pair<SetNode<T>*, std::vector<T>>>
 	groupBySet(const std::vector<SetNode<T>*>& sets)
 {
-	std::unordered_map<SetNode<T>*, std::vector<T>> groups;
+	std::unordered_map<SetNode<T>*, size_t> groupIndex;
+	std::vector<std::pair<SetNode<T>*, std::vector<T>>> groups;
 	for (auto& setNode : sets)
 	{
-		groups[findSet(setNode)].push_back(setNode->data);
+		SetNode<T>* root = findSet(setNode);
+		auto it = groupIndex.find(root);
+		if (it == groupIndex.end())
+		{
+			it = groupIndex.emplace(root, groups.size()).first;
+			groups.emplace_back(root, std::vector<T>());
+		}
+		groups[it->second].second.push_back(setNode->data);
 	}
 	return groups;
 }
