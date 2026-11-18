@@ -1,0 +1,37 @@
+# Git files
+.git
+.gitignore
+
+# Documentation (already in the image)
+*.md
+docs/
+
+# Python cache and build artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist/
+build/
+*.whl
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test outputs and temporary files
+*.log
+test_*/
+flye_test_*/
+
+# Docker files (don't need to copy Dockerfile into itself)
+Dockerfile
+.dockerignore
