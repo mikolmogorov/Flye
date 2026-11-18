@@ -23,7 +23,15 @@ public:
 	template <typename T, typename U>
 	std::size_t operator()(const std::pair<T, U> &x) const
 	{
-		return std::hash<T>()(x.first) ^ std::hash<U>()(x.second);
+		//Combine the two hashes with mixing (boost::hash_combine style).
+		//A plain XOR of two pointer hashes collapses onto a handful of
+		//values when the objects were allocated consecutively (e.g. adjacent
+		//graph nodes), turning every lookup into a linear bucket scan.
+		std::size_t h1 = std::hash<T>()(x.first);
+		std::size_t h2 = std::hash<U>()(x.second);
+		h1 ^= (h1 >> 33); h1 *= 0xff51afd7ed558ccdULL; h1 ^= (h1 >> 33);
+		h2 ^= (h2 >> 33); h2 *= 0xc4ceb9fe1a85ec53ULL; h2 ^= (h2 >> 33);
+		return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
 	}
 };
 
