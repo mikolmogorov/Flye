@@ -31,8 +31,11 @@
 bool ChimeraDetector::isChimeric(FastaRecord::Id readId,
 								 const std::vector<OverlapRange>& readOvlps)
 {
-	//const int JUMP = Config::get("maximum_jump");
-	if (!_chimeras.contains(readId))
+	// One entry per physical read: separate strand entries can be populated
+	// by different racing callers. Coverage windows below use the same
+	// forward coordinate system regardless of which strand arrives first.
+	auto cacheId = readId.strand() ? readId : readId.rc();
+	if (!_chimeras.contains(cacheId))
 	{
 		bool result = this->testReadByCoverage(readId, readOvlps);
 		/*for (const auto& ovlp : IterNoOverhang(readOvlps))
@@ -46,10 +49,9 @@ bool ChimeraDetector::isChimeric(FastaRecord::Id readId,
 				}
 			}
 		}*/
-		_chimeras.insert(readId, result);
-		_chimeras.insert(readId.rc(), result);
+		_chimeras.insert(cacheId, result);
 	}
-	return _chimeras.find(readId);
+	return _chimeras.find(cacheId);
 }
 
 void ChimeraDetector::estimateGlobalCoverage()
@@ -122,8 +124,13 @@ std::vector<int32_t>
 
 		//skip 2 first/last windows of overlap to be more robust to
 		//possible coorinate shifts
-		for (int pos = ovlp.curBegin / WINDOW + FLANK; 		
-			 pos <= ovlp.curEnd / WINDOW - FLANK; ++pos)
+		// Window rounding is not symmetric for arbitrary read lengths. Bin
+		// both strands in forward coordinates so the cached verdict does not
+		// depend on the strand of the first caller.
+		int begin = readId.strand() ? ovlp.curBegin : ovlp.curLen - ovlp.curEnd - 1;
+		int end = readId.strand() ? ovlp.curEnd : ovlp.curLen - ovlp.curBegin - 1;
+		for (int pos = begin / WINDOW + FLANK;
+			 pos <= end / WINDOW - FLANK; ++pos)
 		{
 			//assert(pos - FLANK >= 0 && pos - FLANK < (int)coverage.size());
 			++coverage.at(pos - FLANK);

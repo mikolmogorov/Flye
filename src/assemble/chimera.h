@@ -19,6 +19,8 @@ public:
 	{}
 
 	void estimateGlobalCoverage();
+	// Requires the complete overlap list, not a capped quickSeqOverlaps
+	// prefix: this verdict is cached and reused by subsequent callers.
 	bool isChimeric(FastaRecord::Id readId, 
 					const std::vector<OverlapRange>& readOvlps);
 
