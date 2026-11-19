@@ -115,6 +115,16 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 	static const float SM_GAP = (float)Config::get("chain_small_gap_penalty");
 	static const int GAP_JUMP_THLD = (int)Config::get("chain_gap_jump_threshold");
 	static const int MAX_GAP = (int)Config::get("max_jump_gap");
+	static const std::vector<int32_t> GAP_COST_TABLE = []()
+	{
+		std::vector<int32_t> table(MAX_GAP + 1);
+		for (int32_t g = 0; g <= MAX_GAP; ++g)
+		{
+			table[g] = (g > GAP_JUMP_THLD ? LG_GAP : SM_GAP) * g;
+		}
+		return table;
+	}();
+	const int32_t* const gapCostPtr = GAP_COST_TABLE.data();
 
 	//outSuggestChimeric = false;
 	int32_t curLen = fastaRec.sequence.length();
@@ -188,15 +198,16 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 
 	for (const auto& curKmerPos : IterKmers(fastaRec.sequence))
 	{
-		if (_vertexIndex.isRepetitive(curKmerPos.kmer))
+		Kmer stdKmer = curKmerPos.kmer;
+		bool revComp = stdKmer.standardForm();
+		if (_vertexIndex.isRepetitiveCanonical(stdKmer))
 		{
 			curFilteredPos.push_back(curKmerPos.position);
 			continue;
 		}
-		if (!_vertexIndex.kmerFreq(curKmerPos.kmer)) continue;
 
 		//FastaRecord::Id prevSeqId = FastaRecord::ID_NONE;
-		for (const auto& extReadPos : _vertexIndex.iterKmerPos(curKmerPos.kmer))
+		for (const auto& extReadPos : _vertexIndex.iterKmerPosCanonical(stdKmer, revComp))
 		{
 			//no trivial matches
 			if ((extReadPos.readId == fastaRec.id &&
@@ -247,23 +258,36 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		}
 		if (uniqueMatches < minKmerSruvivalRate * _minOverlap) continue;
 
-		matchesList.assign(vecMatches.begin() + extRangeBegin,
-						   vecMatches.begin() + extRangeEnd);
-		assert(matchesList.size() > 0 && 
-			   matchesList.size() < (size_t)std::numeric_limits<int32_t>::max());
+		const size_t numMatches = extRangeEnd - extRangeBegin;
+		assert(numMatches > 0 &&
+			   numMatches < (size_t)std::numeric_limits<int32_t>::max());
 
-		FastaRecord::Id extId = matchesList.front().extId;
+		const bool crossesChunk =
+			(extRangeBegin / (1024 * 1024)) != ((extRangeEnd - 1) / (1024 * 1024));
+		const KmerMatch* rawSlice = nullptr;
+		if (crossesChunk)
+		{
+			matchesList.assign(vecMatches.begin() + extRangeBegin,
+							   vecMatches.begin() + extRangeEnd);
+			rawSlice = matchesList.data();
+		}
+		else
+		{
+			rawSlice = &vecMatches[extRangeBegin];
+		}
+		FastaRecord::Id extId = rawSlice[0].extId;
 		int32_t extLen = _seqContainer.seqLen(extId);
 
 		//pre-filtering
-		int32_t minCur = matchesList.front().curPos;
-		int32_t maxCur = matchesList.back().curPos;
+		int32_t minCur = rawSlice[0].curPos;
+		int32_t maxCur = rawSlice[numMatches - 1].curPos;
 		int32_t minExt = std::numeric_limits<int32_t>::max();
 		int32_t maxExt = std::numeric_limits<int32_t>::min();
-		for (const auto& match : matchesList)
+		for (size_t k = 0; k < numMatches; ++k)
 		{
-			minExt = std::min(minExt, match.extPos);
-			maxExt = std::max(maxExt, match.extPos);
+			int32_t ep = rawSlice[k].extPos;
+			minExt = std::min(minExt, ep);
+			maxExt = std::max(maxExt, ep);
 		}
 		if (maxCur - minCur < _minOverlap || 
 			maxExt - minExt < _minOverlap) continue;
@@ -276,16 +300,23 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		//++uniqueCandidates;
 
 		//chain matiching positions with DP
-		scoreTable.assign(matchesList.size(), 0);
-		backtrackTable.assign(matchesList.size(), -1);
+		scoreTable.assign(numMatches, 0);
+		backtrackTable.assign(numMatches, -1);
 
 		bool extSorted = extLen > curLen;
+		const KmerMatch* matchesPtr = rawSlice;
 		if (extSorted)
 		{
+			if (!crossesChunk)
+			{
+				matchesList.assign(rawSlice, rawSlice + numMatches);
+			}
 			std::sort(matchesList.begin(), matchesList.end(),
 					  [](const KmerMatch& k1, const KmerMatch& k2)
 					  {return k1.extPos < k2.extPos;});
+			matchesPtr = matchesList.data();
 		}
+		const int32_t nMatches = static_cast<int32_t>(numMatches);
 
 		//Tries to extend a chain ending at match j with match i.
 		//Returns true if the scan for predecessors of i should stop.
@@ -293,10 +324,10 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 								  int32_t i, int32_t j,
 								  int32_t& maxScore, int32_t& maxId)
 		{
-			int32_t curNext = matchesList[i].curPos;
-			int32_t extNext = matchesList[i].extPos;
-			int32_t curPrev = matchesList[j].curPos;
-			int32_t extPrev = matchesList[j].extPos;
+			int32_t curNext = matchesPtr[i].curPos;
+			int32_t extNext = matchesPtr[i].extPos;
+			int32_t curPrev = matchesPtr[j].curPos;
+			int32_t extPrev = matchesPtr[j].extPos;
 			int32_t jumpDiv = abs((curNext - curPrev) -
 								  (extNext - extPrev));
 			if (0 < curNext - curPrev && curNext - curPrev < _maxJump &&
@@ -308,8 +339,7 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 									  kmerSize);
 				//int32_t gapCost = jumpDiv ?
 				//		kmerSize * jumpDiv + ilog2_32(jumpDiv) : 0;
-				int32_t gapCost = (jumpDiv > GAP_JUMP_THLD ? LG_GAP : SM_GAP) * jumpDiv;
-				int32_t nextScore = scores[j] + matchScore - gapCost;
+				int32_t nextScore = scores[j] + matchScore - gapCostPtr[jumpDiv];
 				if (nextScore > maxScore)
 				{
 					maxScore = nextScore;
@@ -329,28 +359,27 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		//the one before can hold a valid j. The two blocks are merged in
 		//descending j, the original visiting order, so scores, backtracks
 		//and early breaks are unchanged.
-		const int32_t numMatches = (int32_t)matchesList.size();
-		primPos.resize(numMatches);
-		blockOf.resize(numMatches);
+		primPos.resize(nMatches);
+		blockOf.resize(nMatches);
 		int32_t maxBlock = 0;
-		for (int32_t k = 0; k < numMatches; ++k)
+		for (int32_t k = 0; k < nMatches; ++k)
 		{
-			const KmerMatch& m = matchesList[k];
+			const KmerMatch& m = matchesPtr[k];
 			primPos[k] = extSorted ? m.extPos : m.curPos;
 			blockOf[k] = (extSorted ? m.curPos : m.extPos) / _maxJump;
 			maxBlock = std::max(maxBlock, blockOf[k]);
 		}
 		blockStart.assign(maxBlock + 2, 0);
-		for (int32_t k = 0; k < numMatches; ++k) ++blockStart[blockOf[k] + 1];
+		for (int32_t k = 0; k < nMatches; ++k) ++blockStart[blockOf[k] + 1];
 		for (int32_t b = 0; b <= maxBlock; ++b) blockStart[b + 1] += blockStart[b];
-		blockIdx.resize(numMatches);
+		blockIdx.resize(nMatches);
 		blockFill.assign(blockStart.begin(), blockStart.end() - 1);
-		for (int32_t k = 0; k < numMatches; ++k) blockIdx[blockFill[blockOf[k]]++] = k;
+		for (int32_t k = 0; k < nMatches; ++k) blockIdx[blockFill[blockOf[k]]++] = k;
 		//from here on, blockFill[b] is the end of the already-processed part of block b
 		blockFill.assign(blockStart.begin(), blockStart.end() - 1);
 		++blockFill[blockOf[0]];
 
-		for (int32_t i = 1; i < numMatches; ++i)
+		for (int32_t i = 1; i < nMatches; ++i)
 		{
 			int32_t maxScore = 0;
 			int32_t maxId = 0;
@@ -387,15 +416,15 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		{
 			std::vector<int32_t> refScore(numMatches, 0);
 			std::vector<int32_t> refBack(numMatches, -1);
-			for (int32_t i = 1; i < numMatches; ++i)
+			for (int32_t i = 1; i < nMatches; ++i)
 			{
 				int32_t maxScore = 0;
 				int32_t maxId = 0;
 				for (int32_t j = i - 1; j >= 0; --j)
 				{
 					if (tryPredecessor(refScore, i, j, maxScore, maxId)) break;
-					if (extSorted && matchesList[i].extPos - matchesList[j].extPos > _maxJump) break;
-					if (!extSorted && matchesList[i].curPos - matchesList[j].curPos > _maxJump) break;
+					if (extSorted && matchesPtr[i].extPos - matchesPtr[j].extPos > _maxJump) break;
+					if (!extSorted && matchesPtr[i].curPos - matchesPtr[j].curPos > _maxJump) break;
 				}
 				refScore[i] = std::max(maxScore, kmerSize);
 				if (maxScore > kmerSize) refBack[i] = maxId;
@@ -420,7 +449,7 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		std::vector<std::pair<int32_t, int32_t>> kmerMatches;
 		
 		//initiate chains from the highest scores in the table (e.g. local maximums)
-		std::vector<size_t> orderedScores(backtrackTable.size());
+		std::vector<size_t> orderedScores(numMatches);
 		std::iota(orderedScores.begin(), orderedScores.end(), 0);
 		std::sort(orderedScores.begin(), orderedScores.end(),
 				  [](size_t a, size_t b) {return scoreTable[a] > scoreTable[b];});
@@ -460,11 +489,11 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 				if (_keepAlignment)
 				{
 					if (kmerMatches.empty() || 
-						kmerMatches.back().first - matchesList[pos].curPos >
+						kmerMatches.back().first - matchesPtr[pos].curPos >
 						kmerSize)
 					{
-						kmerMatches.emplace_back(matchesList[pos].curPos,
-								 				 matchesList[pos].extPos);
+						kmerMatches.emplace_back(matchesPtr[pos].curPos,
+												 matchesPtr[pos].extPos);
 					}
 				}
 
@@ -476,12 +505,12 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 
 			//Logger::get().debug() << chainStart - firstMatch << " " << lastMatch - firstMatch;
 
-			OverlapRange ovlp(fastaRec.id, matchesList.front().extId,
-							  matchesList[firstMatch].curPos, 
-							  matchesList[firstMatch].extPos,
+			OverlapRange ovlp(fastaRec.id, extId,
+							  matchesPtr[firstMatch].curPos,
+							  matchesPtr[firstMatch].extPos,
 							  curLen, extLen);
-			ovlp.curEnd = matchesList[lastMatch].curPos + kmerSize - 1;
-			ovlp.extEnd = matchesList[lastMatch].extPos + kmerSize - 1;
+			ovlp.curEnd = matchesPtr[lastMatch].curPos + kmerSize - 1;
+			ovlp.extEnd = matchesPtr[lastMatch].extPos + kmerSize - 1;
 			ovlp.score = scoreTable[lastMatch] - scoreTable[firstMatch] + 
 						 kmerSize - 1;
 
@@ -1010,6 +1039,7 @@ void OverlapContainer::buildIntervalTree()
 	{
 		std::vector<Interval<const OverlapRange*>> intervals;
 		auto& overlaps = this->unsafeSeqOverlaps(seq);
+		intervals.reserve(overlaps.size());
 		for (const auto& ovlp : overlaps)
 		{
 			intervals.emplace_back(ovlp.curBegin, ovlp.curEnd, &ovlp);

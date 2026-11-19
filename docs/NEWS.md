@@ -1,3 +1,10 @@
+Flye 2.9.7 release (17 Nov 2026)
+===============================
+* Performance improvement: 15-40% wall clock time reduction on various datasets thanks for the
+contributions from the Google DeepMind Bioresilience program. 
+See the PRs for the details: 809, 810, 811, 812, 813, 814, 815, 816
+* No logical changes, assemblies should be similar to the previous versions, wrt to some inherent non-determinism
+
 Flye 2.9.6 release (2 May 2025)
 ==============================
 * Minor fix release, most assmeblies should not change

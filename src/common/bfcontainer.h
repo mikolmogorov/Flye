@@ -212,10 +212,10 @@ public:
 			return *this;
 		}
 
-        BFIterator& operator++(int) 
+        BFIterator operator++(int)
 		{
 			auto tmp(*this); 
-			++(*tmp); 
+			++(*this);
 			return tmp;
 		}
 
@@ -230,10 +230,10 @@ public:
 			return *this;
 		}
 
-        BFIterator& operator--(int) 
+        BFIterator operator--(int)
 		{
 			auto tmp(*this); 
-			--tmp; 
+			--(*this);
 			return tmp;
 		}
 

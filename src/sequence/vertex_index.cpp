@@ -213,19 +213,48 @@ std::vector<VertexIndex::KmerFreq>
 	VertexIndex::yieldFrequentKmers(const FastaRecord::Id& seqId,
 									float selectRate, int tandemFreq)
 {
-	thread_local std::unordered_map<Kmer, size_t> localFreq;
-	localFreq.clear();
+	struct FlatSlot
+	{
+		Kmer key;
+		uint32_t count;
+		uint32_t epoch;
+	};
+	thread_local std::vector<FlatSlot> flatTable;
+	thread_local uint32_t curEpoch = 1;
+
+	const DnaSequence& seq = _seqContainer.getSeq(seqId);
+	const size_t seqLen = seq.length();
+	if (seqLen < Parameters::get().kmerSize) return {};
+	const size_t numKmers = seqLen - Parameters::get().kmerSize + 1;
+
+	size_t tableMask = 0;
+	if (tandemFreq > 0)
+	{
+		size_t cap = 1024;
+		while (cap < numKmers * 2) cap <<= 1;
+		if (flatTable.size() < cap)
+		{
+			flatTable.assign(cap, FlatSlot{Kmer(0), 0, 0});
+		}
+		tableMask = flatTable.size() - 1;
+		if (++curEpoch == 0)
+		{
+			for (auto& s : flatTable) s.epoch = 0;
+			curEpoch = 1;
+		}
+	}
+
 	std::vector<KmerFreq> topKmers;
-	topKmers.reserve(_seqContainer.seqLen(seqId));
+	topKmers.reserve(numKmers);
 
 	//Collect the read's k-mers first, so the random flat-counter lookups can
 	//be prefetched ahead and several cache misses stay in flight at once.
-	//getFreq() and localFreq still see the k-mers in the original order.
+	//getFreq() and the per-read table still see the k-mers in the original order.
 	thread_local std::vector<KmerPosition> readKmers;
 	thread_local std::vector<Kmer> stdKmers;
 	readKmers.clear();
 	stdKmers.clear();
-	for (const auto& kmerPos : IterKmers(_seqContainer.getSeq(seqId)))
+	for (const auto& kmerPos : IterKmers(seq))
 	{
 		auto stdKmer = kmerPos.kmer;
 		stdKmer.standardForm();
@@ -234,41 +263,60 @@ std::vector<VertexIndex::KmerFreq>
 	}
 
 	const size_t PREFETCH_AHEAD = 16;
-	const size_t numKmers = stdKmers.size();
-	for (size_t i = 0; i < std::min(PREFETCH_AHEAD, numKmers); ++i)
+	const size_t numRead = stdKmers.size();
+	for (size_t i = 0; i < std::min(PREFETCH_AHEAD, numRead); ++i)
 	{
 		_kmerCounter.prefetch(stdKmers[i]);
 	}
-	for (size_t i = 0; i < numKmers; ++i)
+	for (size_t i = 0; i < numRead; ++i)
 	{
-		if (i + PREFETCH_AHEAD < numKmers) _kmerCounter.prefetch(stdKmers[i + PREFETCH_AHEAD]);
-		size_t freq = _kmerCounter.getFreq(stdKmers[i]);
+		if (i + PREFETCH_AHEAD < numRead) _kmerCounter.prefetch(stdKmers[i + PREFETCH_AHEAD]);
+		const Kmer& stdKmer = stdKmers[i];
+		size_t freq = _kmerCounter.getFreq(stdKmer);
 
-		++localFreq[stdKmers[i]];
+		if (tandemFreq > 0)
+		{
+			size_t idx = stdKmer.hash() & tableMask;
+			while (flatTable[idx].epoch == curEpoch && flatTable[idx].key != stdKmer)
+			{
+				idx = (idx + 1) & tableMask;
+			}
+			if (flatTable[idx].epoch != curEpoch)
+			{
+				flatTable[idx] = {stdKmer, 1, curEpoch};
+			}
+			else
+			{
+				++flatTable[idx].count;
+			}
+		}
 		topKmers.push_back({readKmers[i].kmer, readKmers[i].position, freq});
 	}
 
 	if (topKmers.empty()) return {};
-	std::sort(topKmers.begin(), topKmers.end(),
-			  [](const KmerFreq& k1, const KmerFreq& k2)
-			   {return k1.freq > k2.freq;});
-	const size_t maxKmers = selectRate * topKmers.size();
+	const size_t maxKmers = std::min<size_t>(selectRate * topKmers.size(), topKmers.size() - 1);
+	std::nth_element(topKmers.begin(), topKmers.begin() + maxKmers, topKmers.end(),
+					 [](const KmerFreq& k1, const KmerFreq& k2)
+					 {return k1.freq > k2.freq;});
 	const size_t minFreq = topKmers[maxKmers].freq;
 
-	auto itVec = topKmers.begin();
-	while(itVec != topKmers.end() && itVec->freq >= minFreq) ++itVec;
-	topKmers.erase(itVec, topKmers.end());
-
-	if (tandemFreq > 0)
-	{
-		topKmers.erase(std::remove_if(topKmers.begin(), topKmers.end(),
-							[tandemFreq](KmerFreq kf)
+	topKmers.erase(std::remove_if(topKmers.begin(), topKmers.end(),
+						[minFreq, tandemFreq, tableMask](KmerFreq kf)
+						{
+							if (kf.freq < minFreq) return true;
+							if (tandemFreq > 0)
 							{
 								kf.kmer.standardForm();
-								return localFreq[kf.kmer] > (size_t)tandemFreq;
-							}), 
-					   topKmers.end());
-	}
+								size_t idx = kf.kmer.hash() & tableMask;
+								while (flatTable[idx].key != kf.kmer)
+								{
+									idx = (idx + 1) & tableMask;
+								}
+								return flatTable[idx].count > (uint32_t)tandemFreq;
+							}
+							return false;
+						}),
+				   topKmers.end());
 
 	return topKmers;
 }
@@ -490,48 +538,54 @@ void KmerCounter::count(bool useFlatCounter)
 	Logger::get().debug() << "Updating k-mer histogram";
 	if (_useFlatCounter)
 	{
-		//Same histogram as calling getFreq() for every k-mer id, split across
-		//threads. Each byte holds two 4-bit counts (k-mer ids 2*pos and 2*pos+1).
-		//Empty bytes are skipped; saturated counts (15) still go through getFreq(),
-		//which adds the hash counter. std::map ignores insertion order, so summing
-		//the per-thread histograms gives the identical map.
-		const size_t numThreads = std::max(1, (int)Parameters::get().numThreads);
-		std::vector<KmerDistribution> partial(numThreads);
-		auto histWorker = [this, numThreads, &partial](size_t threadId)
+		const size_t numChunks = 256;
+		std::vector<size_t> chunks(numChunks);
+		for (size_t i = 0; i < numChunks; ++i) chunks[i] = i;
+
+		std::mutex histMutex;
+		size_t globalSmallHist[16] = {0};
+		const uint8_t* rawFlat = reinterpret_cast<const uint8_t*>(_flatCounter);
+
+		std::function<void(const size_t&)> scanChunk =
+		[rawFlat, numChunks, &histMutex, &globalSmallHist](const size_t& chunkId)
 		{
-			size_t smallCounts[15] = {0};
-			KmerDistribution& hist = partial[threadId];
-			const size_t chunk = (COUNTER_LEN + numThreads - 1) / numThreads;
-			const size_t begin = std::min(COUNTER_LEN, threadId * chunk);
-			const size_t end = std::min(COUNTER_LEN, begin + chunk);
-			for (size_t pos = begin; pos < end; ++pos)
+			const size_t startByte = (COUNTER_LEN * chunkId) / numChunks;
+			const size_t endByte = (COUNTER_LEN * (chunkId + 1)) / numChunks;
+			size_t localHist[16] = {0};
+
+			size_t i = startByte;
+			for (; i + 8 <= endByte; i += 8)
 			{
-				uint8_t bits = _flatCounter[pos].load(std::memory_order_relaxed);
-				if (bits == 0) continue;
-				for (size_t highBits = 0; highBits < 2; ++highBits)
+				uint64_t word;
+				std::memcpy(&word, rawFlat + i, sizeof(uint64_t));
+				if (word == 0) continue;
+				for (int b = 0; b < 16; ++b)
 				{
-					uint8_t count = highBits ? (bits >> 4) : (bits & 15);
-					if (count < 15)
-					{
-						++smallCounts[count];
-					}
-					else
-					{
-						hist[this->getFreq(Kmer(pos * 2 + highBits))] += 1;
-					}
+					++localHist[(word >> (b * 4)) & 0xF];
 				}
 			}
-			for (size_t c = 1; c < 15; ++c)
+			for (; i < endByte; ++i)
 			{
-				if (smallCounts[c] > 0) hist[c] += smallCounts[c];
+				uint8_t byte = rawFlat[i];
+				if (byte == 0) continue;
+				++localHist[byte & 0xF];
+				++localHist[byte >> 4];
 			}
+
+			histMutex.lock();
+			for (int f = 1; f < 16; ++f) globalSmallHist[f] += localHist[f];
+			histMutex.unlock();
 		};
-		std::vector<std::thread> workers;
-		for (size_t t = 0; t < numThreads; ++t) workers.emplace_back(histWorker, t);
-		for (auto& w : workers) w.join();
-		for (const auto& hist : partial)
+		processInParallel(chunks, scanChunk, Parameters::get().numThreads, false);
+
+		for (const auto& kv : _hashCounter.lock_table())
 		{
-			for (const auto& freqCount : hist) _kmerDistribution[freqCount.first] += freqCount.second;
+			--globalSmallHist[15];
+			_kmerDistribution[15 + kv.second] += 1;
+		}
+		for (size_t f = 1; f < 16; ++f)
+		{
+			if (globalSmallHist[f] > 0) _kmerDistribution[f] += globalSmallHist[f];
 		}
 
 		//FLYE_HIST_VERIFY=1: rebuild the histogram with the original serial loop
