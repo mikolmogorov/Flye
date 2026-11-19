@@ -8,9 +8,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <memory>
 #include <vector>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 
 #include <cuckoohash_map.hh>
 
@@ -34,7 +36,7 @@ public:
 	{
 		if (_flatCounter) 
 		{
-			delete[] _flatCounter;
+			free(_flatCounter);	//allocated with posix_memalign in count()
 			_flatCounter = nullptr;
 		}
 	}
@@ -46,6 +48,13 @@ public:
 
 	void   count(bool useFlatCounter);
 	size_t getFreq(Kmer kmer) const;
+
+	//Starts loading the flat counter byte of a standard-form k-mer so a
+	//later getFreq() finds it in cache. Does not change any result.
+	void prefetch(Kmer kmer) const
+	{
+		if (_useFlatCounter) __builtin_prefetch(&_flatCounter[kmer.numRepr() / 2], 0, 0);
+	}
 	size_t getKmerNum() const;
 	void clear();
 	void setOutputProgress(bool progress) {_outputProgress = progress;}
@@ -58,6 +67,10 @@ private:
 	std::atomic<uint8_t>*			_flatCounter;
 	//std::vector<std::atomic<char>>  _flatCounter;
 	cuckoohash_map<Kmer, size_t> 	_hashCounter;
+	//Set at the end of count(), when _hashCounter stops changing. Holds every
+	//lock of _hashCounter, so getFreq() can read it without taking locks.
+	//Released by clear(); declared after _hashCounter so it is destroyed first.
+	std::unique_ptr<cuckoohash_map<Kmer, size_t>::locked_table> _frozenHash;
 	KmerDistribution _kmerDistribution;
 
 	std::atomic<size_t> _numKmers;

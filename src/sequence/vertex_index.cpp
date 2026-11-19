@@ -8,12 +8,44 @@
 #include <algorithm>
 #include <queue>
 #include <cmath>
+#include <cstdlib>
+#include <thread>
+#include <new>
+#include <sys/mman.h>
 
 #include "vertex_index.h"
 #include "../common/logger.h"
 #include "../common/parallel.h"
 #include "../common/config.h"
 #include "../common/memory_info.h"
+
+//FLYE_FREQ_DIGEST=1: sum a hash of every (k-mer, frequency) pair returned by
+//KmerCounter::getFreq(). The sum ignores call order, so two runs that return
+//the same frequencies for the same calls print the same digest at clear().
+namespace
+{
+	bool freqDigestOn = false;
+	std::atomic<uint64_t> freqDigest(0);
+	std::atomic<uint64_t> freqCalls(0);
+
+	uint64_t mixFreq(uint64_t kmer, uint64_t freq)
+	{
+		uint64_t z = kmer * 0x9E3779B97F4A7C15ULL + freq + 0x632BE59BD9B4E019ULL;
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		return z ^ (z >> 31);
+	}
+
+	size_t recordFreq(Kmer kmer, size_t freq)
+	{
+		if (freqDigestOn)
+		{
+			freqDigest.fetch_add(mixFreq(kmer.numRepr(), freq), std::memory_order_relaxed);
+			freqCalls.fetch_add(1, std::memory_order_relaxed);
+		}
+		return freq;
+	}
+}
 
 
 void VertexIndex::countKmers()
@@ -215,10 +247,31 @@ std::vector<VertexIndex::KmerFreq>
 	std::vector<KmerFreq> topKmers;
 	topKmers.reserve(numKmers);
 
+	//Collect the read's k-mers first, so the random flat-counter lookups can
+	//be prefetched ahead and several cache misses stay in flight at once.
+	//getFreq() and the per-read table still see the k-mers in the original order.
+	thread_local std::vector<KmerPosition> readKmers;
+	thread_local std::vector<Kmer> stdKmers;
+	readKmers.clear();
+	stdKmers.clear();
 	for (const auto& kmerPos : IterKmers(seq))
 	{
 		auto stdKmer = kmerPos.kmer;
 		stdKmer.standardForm();
+		readKmers.push_back(kmerPos);
+		stdKmers.push_back(stdKmer);
+	}
+
+	const size_t PREFETCH_AHEAD = 16;
+	const size_t numRead = stdKmers.size();
+	for (size_t i = 0; i < std::min(PREFETCH_AHEAD, numRead); ++i)
+	{
+		_kmerCounter.prefetch(stdKmers[i]);
+	}
+	for (size_t i = 0; i < numRead; ++i)
+	{
+		if (i + PREFETCH_AHEAD < numRead) _kmerCounter.prefetch(stdKmers[i + PREFETCH_AHEAD]);
+		const Kmer& stdKmer = stdKmers[i];
 		size_t freq = _kmerCounter.getFreq(stdKmer);
 
 		if (tandemFreq > 0)
@@ -237,7 +290,7 @@ std::vector<VertexIndex::KmerFreq>
 				++flatTable[idx].count;
 			}
 		}
-		topKmers.push_back({kmerPos.kmer, kmerPos.position, freq});
+		topKmers.push_back({readKmers[i].kmer, readKmers[i].position, freq});
 	}
 
 	if (topKmers.empty()) return {};
@@ -423,8 +476,16 @@ void KmerCounter::count(bool useFlatCounter)
 	static const size_t COUNTER_LEN = std::pow(4, Parameters::get().kmerSize) / 2;
 	if (useFlatCounter)
 	{
-		_flatCounter = new std::atomic<uint8_t>[COUNTER_LEN];
-		std::memset(_flatCounter, 0, COUNTER_LEN);
+		//2 MiB-aligned and marked for transparent huge pages: lookups into this
+		//8 GB array are random, and on 4 KiB pages nearly every one also needs a
+		//page-table walk. Freed with free() in clear() and ~KmerCounter().
+		const size_t HUGE_PAGE = 2 * 1024 * 1024;
+		const size_t allocLen = (COUNTER_LEN + HUGE_PAGE - 1) / HUGE_PAGE * HUGE_PAGE;
+		void* flatMem = nullptr;
+		if (posix_memalign(&flatMem, HUGE_PAGE, allocLen) != 0) throw std::bad_alloc();
+		madvise(flatMem, allocLen, MADV_HUGEPAGE);
+		std::memset(flatMem, 0, allocLen);
+		_flatCounter = static_cast<std::atomic<uint8_t>*>(flatMem);
 	}
  
 	if (_outputProgress) Logger::get().info() << "Counting k-mers:";
@@ -526,6 +587,27 @@ void KmerCounter::count(bool useFlatCounter)
 		{
 			if (globalSmallHist[f] > 0) _kmerDistribution[f] += globalSmallHist[f];
 		}
+
+		//FLYE_HIST_VERIFY=1: rebuild the histogram with the original serial loop
+		//and abort on any difference.
+		const char* verifyEnv = std::getenv("FLYE_HIST_VERIFY");
+		if (verifyEnv && verifyEnv[0] == '1')
+		{
+			KmerDistribution reference;
+			for (size_t kmerId = 0; kmerId < COUNTER_LEN * 2; ++kmerId)
+			{
+				Kmer kmer(kmerId);
+				size_t freq = this->getFreq(kmer);
+				if (freq > 0) reference[freq] += 1;
+			}
+			if (reference != _kmerDistribution)
+			{
+				Logger::get().error() << "FLYE_HIST_VERIFY: k-mer histogram mismatch";
+				std::abort();
+			}
+			Logger::get().debug() << "FLYE_HIST_VERIFY: histogram identical ("
+				<< reference.size() << " distinct frequencies)";
+		}
 	}
 	else
 	{
@@ -540,8 +622,18 @@ void KmerCounter::count(bool useFlatCounter)
 
 	Logger::get().debug() << "Hash size: " << _hashCounter.size();
 	Logger::get().debug() << "Total k-mers " << _numKmers;
-}
 
+	//Counting is finished; nothing writes _hashCounter until clear().
+	//FLYE_FREQ_NOFREEZE=1 keeps the original locking lookups (for A/B checks).
+	const char* noFreezeEnv = std::getenv("FLYE_FREQ_NOFREEZE");
+	if (!(noFreezeEnv && noFreezeEnv[0] == '1'))
+	{
+		_frozenHash.reset(new cuckoohash_map<Kmer, size_t>::locked_table(
+							_hashCounter.lock_table()));
+	}
+	const char* digestEnv = std::getenv("FLYE_FREQ_DIGEST");
+	freqDigestOn = digestEnv && digestEnv[0] == '1';
+}
 
 size_t KmerCounter::getFreq(Kmer kmer) const
 {
@@ -552,10 +644,14 @@ size_t KmerCounter::getFreq(Kmer kmer) const
 	{
 		size_t arrayPos = kmer.numRepr() / 2;
 		bool highBits = kmer.numRepr() % 2;
-		uint8_t count = highBits ? (_flatCounter[arrayPos]) >> 4 : (_flatCounter[arrayPos] & 15);
-		if (count < 15) 
+		//Counting threads have been joined, so a relaxed load returns the same
+		//byte. The default seq_cst load is a load-acquire (ldarb) on Arm, and
+		//no ordering is needed here (no measurable speed change on its own).
+		uint8_t bits = _flatCounter[arrayPos].load(std::memory_order_relaxed);
+		uint8_t count = highBits ? (bits >> 4) : (bits & 15);
+		if (count < 15)
 		{
-			return count;
+			return recordFreq(kmer, count);
 		}
 		else
 		{
@@ -564,17 +660,32 @@ size_t KmerCounter::getFreq(Kmer kmer) const
 	}
 
 	size_t freq = 0;
-	_hashCounter.find(kmer, freq);
-	return freq + addCount;
+	if (_frozenHash)
+	{
+		auto it = _frozenHash->find(kmer);	//no locks: all are held by _frozenHash
+		if (it != _frozenHash->end()) freq = it->second;
+	}
+	else
+	{
+		_hashCounter.find(kmer, freq);
+	}
+	return recordFreq(kmer, freq + addCount);
 }
 
 void KmerCounter::clear()
 {
+	if (freqDigestOn)
+	{
+		Logger::get().debug() << "FLYE_FREQ_DIGEST: calls " << freqCalls.load()
+			<< " digest " << std::hex << freqDigest.load() << std::dec
+			<< (_frozenHash ? " (frozen)" : " (locking)");
+	}
+	_frozenHash.reset();	//release the locks before clearing
 	_hashCounter.clear();
 	_hashCounter.reserve(0);
 	if (_flatCounter)
 	{
-		delete[] _flatCounter;
+		free(_flatCounter);
 		_flatCounter = nullptr;
 	}
 }

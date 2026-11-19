@@ -15,6 +15,8 @@
 #include <cstring>
 #include <iomanip>
 #include <numeric>
+#include <cstdlib>
+#include <atomic>
 
 #include "overlap.h"
 #include "alignment.h"
@@ -123,7 +125,6 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		return table;
 	}();
 	const int32_t* const gapCostPtr = GAP_COST_TABLE.data();
-	const uint32_t maxJumpMinus1 = static_cast<uint32_t>(_maxJump - 1);
 
 	//outSuggestChimeric = false;
 	int32_t curLen = fastaRec.sequence.length();
@@ -135,6 +136,11 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 	thread_local std::vector<KmerMatch> matchesList;
 	thread_local std::vector<int32_t> scoreTable;
 	thread_local std::vector<int32_t> backtrackTable;
+	thread_local std::vector<int32_t> primPos;
+	thread_local std::vector<int32_t> blockOf;
+	thread_local std::vector<int32_t> blockStart;
+	thread_local std::vector<int32_t> blockIdx;
+	thread_local std::vector<int32_t> blockFill;
 
 	static ChunkPool<KmerMatch> sharedChunkPool;	//shared accoress threads
 	BFContainer<KmerMatch> vecMatches(sharedChunkPool);
@@ -182,6 +188,9 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		shrinkAndClear(matchesList, 2);
 		shrinkAndClear(scoreTable, 2);
 		shrinkAndClear(backtrackTable, 2);
+		shrinkAndClear(primPos, 2);
+		shrinkAndClear(blockOf, 2);
+		shrinkAndClear(blockIdx, 2);
 	}
 	timeMemory += std::chrono::duration_cast<std::chrono::duration<float>>
 						(std::chrono::system_clock::now() - timeStart).count();
@@ -309,86 +318,128 @@ OverlapDetector::getSeqOverlaps(const FastaRecord& fastaRec,
 		}
 		const int32_t nMatches = static_cast<int32_t>(numMatches);
 
-		if (!extSorted)
+		//Tries to extend a chain ending at match j with match i.
+		//Returns true if the scan for predecessors of i should stop.
+		auto tryPredecessor = [&](const std::vector<int32_t>& scores,
+								  int32_t i, int32_t j,
+								  int32_t& maxScore, int32_t& maxId)
 		{
-			for (int32_t i = 1; i < nMatches; ++i)
+			int32_t curNext = matchesPtr[i].curPos;
+			int32_t extNext = matchesPtr[i].extPos;
+			int32_t curPrev = matchesPtr[j].curPos;
+			int32_t extPrev = matchesPtr[j].extPos;
+			int32_t jumpDiv = abs((curNext - curPrev) -
+								  (extNext - extPrev));
+			if (0 < curNext - curPrev && curNext - curPrev < _maxJump &&
+				0 < extNext - extPrev && extNext - extPrev < _maxJump &&
+				jumpDiv <= MAX_GAP)
 			{
-				int32_t maxScore = 0;
-				int32_t maxId = 0;
-				const int32_t curNext = matchesPtr[i].curPos;
-				const int32_t extNext = matchesPtr[i].extPos;
-				const int32_t minCurPrev = curNext - _maxJump;
-
-				for (int32_t j = i - 1; j >= 0; --j)
+				int32_t matchScore =
+					std::min(std::min(curNext - curPrev, extNext - extPrev),
+									  kmerSize);
+				//int32_t gapCost = jumpDiv ?
+				//		kmerSize * jumpDiv + ilog2_32(jumpDiv) : 0;
+				int32_t nextScore = scores[j] + matchScore - gapCostPtr[jumpDiv];
+				if (nextScore > maxScore)
 				{
-					const int32_t curPrev = matchesPtr[j].curPos;
-					if (curPrev <= minCurPrev) break;
-					const int32_t dCur = curNext - curPrev;
-					if (dCur <= 0) continue;
-					const int32_t dExt = extNext - matchesPtr[j].extPos;
-					if (static_cast<uint32_t>(dExt - 1) >= maxJumpMinus1) continue;
-					const int32_t jumpDiv = std::abs(dCur - dExt);
-					if (jumpDiv <= MAX_GAP)
-					{
-						const int32_t matchScore =
-							std::min(std::min(dCur, dExt), kmerSize);
-						const int32_t nextScore =
-							scoreTable[j] + matchScore - gapCostPtr[jumpDiv];
-						if (nextScore > maxScore)
-						{
-							maxScore = nextScore;
-							maxId = j;
-							if (jumpDiv == 0 && dCur < kmerSize) break;
-						}
-					}
-				}
+					maxScore = nextScore;
+					maxId = j;
 
-				scoreTable[i] = std::max(maxScore, kmerSize);
-				if (maxScore > kmerSize)
-				{
-					backtrackTable[i] = maxId;
+					if (jumpDiv == 0 && curNext - curPrev < kmerSize) return true;
 				}
 			}
-		}
-		else
+			return false;
+		};
+
+		//A valid predecessor j < i is within _maxJump of i on both sequences.
+		//Matches are sorted by one coordinate (prim), and the original scan
+		//walked back over every match in the prim window, most of which
+		//are far away on the other coordinate (sec). Here matches are also
+		//bucketed by sec in blocks of _maxJump: only the block of i and
+		//the one before can hold a valid j. The two blocks are merged in
+		//descending j, the original visiting order, so scores, backtracks
+		//and early breaks are unchanged.
+		primPos.resize(nMatches);
+		blockOf.resize(nMatches);
+		int32_t maxBlock = 0;
+		for (int32_t k = 0; k < nMatches; ++k)
 		{
+			const KmerMatch& m = matchesPtr[k];
+			primPos[k] = extSorted ? m.extPos : m.curPos;
+			blockOf[k] = (extSorted ? m.curPos : m.extPos) / _maxJump;
+			maxBlock = std::max(maxBlock, blockOf[k]);
+		}
+		blockStart.assign(maxBlock + 2, 0);
+		for (int32_t k = 0; k < nMatches; ++k) ++blockStart[blockOf[k] + 1];
+		for (int32_t b = 0; b <= maxBlock; ++b) blockStart[b + 1] += blockStart[b];
+		blockIdx.resize(nMatches);
+		blockFill.assign(blockStart.begin(), blockStart.end() - 1);
+		for (int32_t k = 0; k < nMatches; ++k) blockIdx[blockFill[blockOf[k]]++] = k;
+		//from here on, blockFill[b] is the end of the already-processed part of block b
+		blockFill.assign(blockStart.begin(), blockStart.end() - 1);
+		++blockFill[blockOf[0]];
+
+		for (int32_t i = 1; i < nMatches; ++i)
+		{
+			int32_t maxScore = 0;
+			int32_t maxId = 0;
+			const int32_t primNext = primPos[i];
+			const int32_t b = blockOf[i];
+			int32_t pa = blockFill[b] - 1;
+			const int32_t endA = blockStart[b];
+			int32_t pb = b > 0 ? blockFill[b - 1] - 1 : -1;
+			const int32_t endB = b > 0 ? blockStart[b - 1] : 0;
+
+			while (true)
+			{
+				//within a block, earlier j are no further right on prim,
+				//so once a j is _maxJump away, the rest of its block is too
+				bool okA = pa >= endA && primNext - primPos[blockIdx[pa]] < _maxJump;
+				bool okB = pb >= endB && primNext - primPos[blockIdx[pb]] < _maxJump;
+				if (!okA && !okB) break;
+				int32_t j = (okA && (!okB || blockIdx[pa] > blockIdx[pb])) ?
+							blockIdx[pa--] : blockIdx[pb--];
+				if (tryPredecessor(scoreTable, i, j, maxScore, maxId)) break;
+			}
+			++blockFill[b];
+
+			scoreTable[i] = std::max(maxScore, kmerSize);
+			if (maxScore > kmerSize)
+			{
+				backtrackTable[i] = maxId;
+			}
+		}
+
+		//FLYE_CHAIN_VERIFY=1 reruns the original full scan and aborts on any difference
+		static const bool verifyChain = std::getenv("FLYE_CHAIN_VERIFY") != nullptr;
+		if (verifyChain)
+		{
+			std::vector<int32_t> refScore(numMatches, 0);
+			std::vector<int32_t> refBack(numMatches, -1);
 			for (int32_t i = 1; i < nMatches; ++i)
 			{
 				int32_t maxScore = 0;
 				int32_t maxId = 0;
-				const int32_t curNext = matchesPtr[i].curPos;
-				const int32_t extNext = matchesPtr[i].extPos;
-				const int32_t minExtPrev = extNext - _maxJump;
-
 				for (int32_t j = i - 1; j >= 0; --j)
 				{
-					const int32_t extPrev = matchesPtr[j].extPos;
-					if (extPrev <= minExtPrev) break;
-					const int32_t dExt = extNext - extPrev;
-					if (dExt <= 0) continue;
-					const int32_t dCur = curNext - matchesPtr[j].curPos;
-					if (static_cast<uint32_t>(dCur - 1) >= maxJumpMinus1) continue;
-					const int32_t jumpDiv = std::abs(dCur - dExt);
-					if (jumpDiv <= MAX_GAP)
-					{
-						const int32_t matchScore =
-							std::min(std::min(dCur, dExt), kmerSize);
-						const int32_t nextScore =
-							scoreTable[j] + matchScore - gapCostPtr[jumpDiv];
-						if (nextScore > maxScore)
-						{
-							maxScore = nextScore;
-							maxId = j;
-							if (jumpDiv == 0 && dCur < kmerSize) break;
-						}
-					}
+					if (tryPredecessor(refScore, i, j, maxScore, maxId)) break;
+					if (extSorted && matchesPtr[i].extPos - matchesPtr[j].extPos > _maxJump) break;
+					if (!extSorted && matchesPtr[i].curPos - matchesPtr[j].curPos > _maxJump) break;
 				}
-
-				scoreTable[i] = std::max(maxScore, kmerSize);
-				if (maxScore > kmerSize)
-				{
-					backtrackTable[i] = maxId;
-				}
+				refScore[i] = std::max(maxScore, kmerSize);
+				if (maxScore > kmerSize) refBack[i] = maxId;
+			}
+			if (refScore != scoreTable || refBack != backtrackTable)
+			{
+				std::cerr << "FLYE_CHAIN_VERIFY: chaining mismatch for "
+						  << fastaRec.description << std::endl;
+				std::abort();
+			}
+			static std::atomic<uint64_t> verifiedTables(0);
+			if (++verifiedTables % 10000 == 0)
+			{
+				std::cerr << "FLYE_CHAIN_VERIFY: " << verifiedTables
+						  << " tables identical" << std::endl;
 			}
 		}
 
