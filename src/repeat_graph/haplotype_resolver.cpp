@@ -870,7 +870,7 @@ namespace
 
 	Superbubble isRightSuperbubble(GraphEdge* startEdge, int maxBubbleLen,
 								   const RepeatGraph& graph, 
-								   const std::unordered_set<GraphEdge*> loopedEdges)
+								   const std::unordered_set<GraphEdge*>& loopedEdges)
 	{
 		//Logger::get().debug() << "\t\tSearching for ref. path";
 		auto refPath = anyPath(startEdge, maxBubbleLen, graph);
