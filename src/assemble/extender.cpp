@@ -278,12 +278,21 @@ void Extender::assembleDisjointigs()
 
 		coveredReads.insert(startRead);
 		coveredReads.insert(startRead.rc());
+		if (_readsContainer.seqLen(startRead) < _safeOverlap) return;
 
 		//getting overlaps without caching first - so we don't
 		//store overlap information for many trashy reads
 		//that won't result into disjointig extension
-		auto startOvlps = _ovlpContainer.quickSeqOverlaps(startRead, 
-														  /*max overlaps*/ 100);
+		// Chimera decisions are cached by read ID and reused during extension.
+		// An input-ID ordered prefix is not complete coverage evidence: a
+		// missing flank in the first 100 overlaps can poison that cache.
+		// Keep the full list temporary, rather than populating the overlap
+		// cache for every rejected seed.
+		std::vector<OverlapRange> startOvlps;
+		if (!_ovlpContainer.copyCachedSeqOverlaps(startRead, startOvlps))
+		{
+			startOvlps = _ovlpContainer.quickSeqOverlaps(startRead, /*max overlaps*/ 0);
+		}
 		int numInnerOvlp = 0;
 		int totalOverlaps = 0;
 		for (const auto& ovlp : IterNoOverhang(startOvlps))
@@ -297,13 +306,16 @@ void Extender::assembleDisjointigs()
 		//int extLeft = this->countLeftExtensions(startOvlps);
 		//int extRight = this->countRightExtensions(startOvlps);
 
-		if (_chimDetector.isChimeric(startRead, startOvlps) ||
-			_readsContainer.seqLen(startRead) < _safeOverlap) return;
+		if (_chimDetector.isChimeric(startRead, startOvlps)) return;
 
 		const bool aggressiveDupFilt = (int)Config::get("aggressive_dup_filter");
 		if (aggressiveDupFilt && numInnerOvlp > totalOverlaps / 2) return;
 		
 		//Good to go!
+		// Extension will request this same complete list. Publish it only
+		// for accepted seeds, avoiding both recomputation and cache growth
+		// for rejected seeds.
+		_ovlpContainer.cacheForwardOverlaps(startRead, std::move(startOvlps));
 		ExtensionInfo exInfo = this->extendDisjointig(startRead);
 
 		//Exclusive part - updating the overall assembly
