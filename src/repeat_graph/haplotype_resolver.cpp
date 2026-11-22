@@ -136,6 +136,17 @@ int HaplotypeResolver::findHeterozygousLoops()
 	GraphProcessor proc(_graph, _asmSeqs);
 	auto unbranchingPaths = proc.getUnbranchingPaths();
 
+	//Index the paths by their end nodes once. The previous version scanned
+	//all unbranching paths for every candidate loop, which is quadratic and
+	//took ~5 min per pass on a 2M-edge metagenome graph.
+	std::unordered_map<GraphNode*, std::vector<UnbranchingPath*>> pathsByRightNode;
+	std::unordered_map<GraphNode*, std::vector<UnbranchingPath*>> pathsByLeftNode;
+	for (auto& path : unbranchingPaths)
+	{
+		pathsByRightNode[path.nodeRight()].push_back(&path);
+		pathsByLeftNode[path.nodeLeft()].push_back(&path);
+	}
+
 	std::unordered_set<FastaRecord::Id> toUnroll;
 	std::unordered_set<FastaRecord::Id> toRemove;
 	int numMasked = 0;
@@ -150,14 +161,17 @@ int HaplotypeResolver::findHeterozygousLoops()
 		if (node->inEdges.size() != 2 ||
 			node->outEdges.size() != 2) continue;
 
+		//same selection as the linear scan (last matching path in
+		//unbranchingPaths order), via the index
 		UnbranchingPath* entrancePath = nullptr;
 		UnbranchingPath* exitPath = nullptr;
-		for (auto& cand : unbranchingPaths)
+		for (auto& cand : pathsByRightNode[node])
 		{
-			if (cand.nodeRight() == node &&
-				loop.id != cand.id) entrancePath = &cand;
-			if (cand.nodeLeft() == node &&
-				loop.id != cand.id) exitPath = &cand;
+			if (loop.id != cand->id) entrancePath = cand;
+		}
+		for (auto& cand : pathsByLeftNode[node])
+		{
+			if (loop.id != cand->id) exitPath = cand;
 		}
 
 		if (entrancePath->isLooped()) continue;
