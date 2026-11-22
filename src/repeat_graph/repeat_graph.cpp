@@ -5,11 +5,15 @@
 #include <deque>
 #include <iomanip>
 #include <cmath>
+#include <atomic>
+#include <memory>
+#include <unordered_set>
 
 #include "../sequence/overlap.h"
 #include "../sequence/vertex_index.h"
 #include "../common/config.h"
 #include "../common/disjoint_set.h"
+#include "../common/parallel.h"
 #include "repeat_graph.h"
 #include "graph_processing.h"
 
@@ -704,6 +708,92 @@ void RepeatGraph::collapseTandems()
 		<< collapsedRight << " right, " << collapsedBoth << " both";
 }
 
+namespace
+{
+	//Lock-free union-find (linking by index + path halving).
+	//Parent index is always <= own index, so the structure is acyclic
+	//regardless of thread interleaving, and the resulting partition
+	//depends only on the set of unite() calls, not on their order.
+	class ParallelDisjointSet
+	{
+	public:
+		explicit ParallelDisjointSet(size_t n): _parent(n)
+		{
+			for (size_t i = 0; i < n; ++i) 
+			{
+				_parent[i].store(i, std::memory_order_relaxed);
+			}
+		}
+
+		size_t find(size_t x)
+		{
+			while (true)
+			{
+				size_t p = _parent[x].load(std::memory_order_acquire);
+				if (p == x) return x;
+				size_t gp = _parent[p].load(std::memory_order_acquire);
+				if (gp != p)
+				{
+					_parent[x].compare_exchange_weak(p, gp, 
+													 std::memory_order_acq_rel);
+				}
+				x = p;
+			}
+		}
+
+		void unite(size_t a, size_t b)
+		{
+			while (true)
+			{
+				a = this->find(a);
+				b = this->find(b);
+				if (a == b) return;
+				if (a < b) std::swap(a, b);		//link larger root under smaller
+				size_t expected = a;
+				if (_parent[a].compare_exchange_strong(expected, b, 
+													   std::memory_order_acq_rel))
+				{
+					return;
+				}
+			}
+		}
+
+	private:
+		std::vector<std::atomic<size_t>> _parent;
+	};
+
+	struct EdgeSeqHash
+	{
+		size_t operator()(const EdgeSequence& s) const
+		{
+			size_t h = std::hash<FastaRecord::Id>()(s.origSeqId);
+			auto mix = [&h](size_t v)
+			{
+				h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+			};
+			mix(std::hash<FastaRecord::Id>()(s.edgeSeqId));
+			mix((size_t)(uint32_t)s.origSeqStart);
+			mix((size_t)(uint32_t)s.origSeqEnd);
+			mix((size_t)(uint32_t)s.seqLen);
+			mix((size_t)(uint32_t)s.origSeqLen);
+			return h;
+		}
+	};
+
+	struct EdgeSeqEqual
+	{
+		bool operator()(const EdgeSequence& a, const EdgeSequence& b) const
+		{
+			return a.edgeSeqId == b.edgeSeqId && 
+				   a.seqLen == b.seqLen &&
+				   a.origSeqId == b.origSeqId &&
+				   a.origSeqLen == b.origSeqLen &&
+				   a.origSeqStart == b.origSeqStart &&
+				   a.origSeqEnd == b.origSeqEnd;
+		}
+	};
+}
+
 void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 {
 	Logger::get().debug() << "Initializing edges";
@@ -715,14 +805,14 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 	std::unordered_map<size_t, GraphNode*> nodeIndex;
 	auto idToNode = [&nodeIndex, this](size_t nodeId)
 	{
-		if (!nodeIndex.count(nodeId))
+		auto it = nodeIndex.find(nodeId);
+		if (it == nodeIndex.end())
 		{
-			nodeIndex[nodeId] = this->addNode();
+			it = nodeIndex.emplace(nodeId, this->addNode()).first;
 		}
-		return nodeIndex[nodeId];
+		return it->second;
 	};
 
-	//for (auto& seqEdgesPair : _gluePoints)
 	size_t checksum = 0;
 	for (auto& seq : _asmSeqs.iterSeqs())
 	{
@@ -732,7 +822,8 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 		if (seqGluepoints.size() < 2) continue;
 		FastaRecord::Id complId = seq.id.rc();
 
-		if (seqGluepoints.size() != _gluePoints[complId].size())
+		auto& complGluepoints = _gluePoints[complId];
+		if (seqGluepoints.size() != complGluepoints.size())
 		{
 			throw std::runtime_error("Graph is not symmetric");
 		}
@@ -743,8 +834,8 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 			GluePoint gpRight = seqGluepoints[i + 1];
 
 			size_t complPos = seqGluepoints.size() - i - 2;
-			GluePoint complLeft = _gluePoints[complId][complPos];
-			GluePoint complRight = _gluePoints[complId][complPos + 1];
+			GluePoint complLeft = complGluepoints[complPos];
+			GluePoint complRight = complGluepoints[complPos + 1];
 
 			GraphNode* leftNode = idToNode(gpLeft.pointId);
 			GraphNode* rightNode = idToNode(gpRight.pointId);
@@ -755,15 +846,14 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 			NodePair revPair = std::make_pair(complLeftNode, complRightNode);
 
 			int32_t seqLen = _asmSeqs.seqLen(gpLeft.seqId);
-			parallelSegments[fwdPair].emplace_back(gpLeft.seqId, seqLen, 
-												   gpLeft.position, 
-							  					   gpRight.position);
-			parallelSegments[revPair]
-				.push_back(parallelSegments[fwdPair].back().complement());
+			auto& fwdSegs = parallelSegments[fwdPair];
+			fwdSegs.emplace_back(gpLeft.seqId, seqLen, 
+								 gpLeft.position, gpRight.position);
+			EdgeSequence complSeg = fwdSegs.back().complement();
+			parallelSegments[revPair].push_back(complSeg);
 
 			complEdges[fwdPair] = revPair;
 			complEdges[revPair] = fwdPair;
-			//Logger::get().debug() << checksum << " " << gpRight.position - gpLeft.position;
 			checksum += (gpRight.position - gpLeft.position) * 
 						(gpRight.position - gpLeft.position);
 		}
@@ -779,51 +869,118 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 
 	//sort nodes wrt to their ids to make it deterministic
 	std::vector<NodePair> sortedKeys;
+	sortedKeys.reserve(parallelSegments.size());
 	for (auto& it : parallelSegments) sortedKeys.push_back(it.first);
 	sortByKey(sortedKeys, [](const NodePair& np)
 			  {return std::make_pair(np.first->nodeId, np.second->nodeId);});
 
+	//select the node pairs to process (one of each complementary pair),
+	//in the deterministic order
 	std::unordered_set<NodePair, pairhash> usedPairs;
-	size_t singletonsFiltered = 0;
+	std::vector<NodePair> pairsToProcess;
 	for (auto& nodePair : sortedKeys)
 	{
 		if (usedPairs.count(nodePair)) continue;
-		auto& nodePairSeqs = parallelSegments[nodePair];
 		usedPairs.insert(complEdges[nodePair]);
+		pairsToProcess.push_back(nodePair);
+	}
 
-		//creating set and building index
-		typedef SetNode<EdgeSequence*> SetSegment;
-		SetVec<EdgeSequence*> segmentSets;
-		std::unordered_map<FastaRecord::Id, 
-						   std::vector<SetSegment*>> segmentIndex;
-		for (auto& seg : nodePairSeqs) 
-		{
-			segmentSets.push_back(new SetSegment(&seg));
-			segmentIndex[seg.origSeqId].push_back(segmentSets.back());
-		}
-		for (auto& seqSegments : segmentIndex)
-		{
-			sortByKey(seqSegments.second, [](SetSegment* const &s){return s->data->origSeqStart;});
-		}
+	//per node pair work item
+	struct PairWork
+	{
+		NodePair nodePair;
+		std::vector<EdgeSequence>* segments;
+		//segment indices grouped by sequence, sorted by origSeqStart
+		std::unordered_map<FastaRecord::Id, std::vector<size_t>> index;
+		std::unique_ptr<ParallelDisjointSet> dsu;
+		//resulting clusters (sorted, singletons filtered)
+		std::vector<std::vector<EdgeSequence*>> clusters;
+	};
+	std::vector<PairWork> works(pairsToProcess.size());
+	std::vector<size_t> workIds;
+	size_t totalSegments = 0;
+	for (size_t i = 0; i < pairsToProcess.size(); ++i)
+	{
+		works[i].nodePair = pairsToProcess[i];
+		works[i].segments = &parallelSegments.at(pairsToProcess[i]);
+		workIds.push_back(i);
+		totalSegments += works[i].segments->size();
+	}
+	Logger::get().debug() << "Clustering " << totalSegments << " segments in "
+		<< works.size() << " node pairs";
 
-		//cluster segments based on their overlaps
-		for (auto& setOne : segmentSets)
+	const size_t numThreads = Parameters::get().numThreads;
+
+	//step 1 (parallel over node pairs): build per-sequence index and union-find
+	std::function<void(const size_t&)> buildIndex = 
+	[&works](const size_t& workId)
+	{
+		auto& w = works[workId];
+		auto& segs = *w.segments;
+		for (size_t i = 0; i < segs.size(); ++i)
 		{
+			w.index[segs[i].origSeqId].push_back(i);
+		}
+		for (auto& seqSegments : w.index)
+		{
+			std::vector<size_t>& ids = seqSegments.second;
+			std::stable_sort(ids.begin(), ids.end(), 
+							 [&segs](size_t a, size_t b)
+							 {return segs[a].origSeqStart < segs[b].origSeqStart;});
+		}
+		w.dsu.reset(new ParallelDisjointSet(segs.size()));
+	};
+	processInParallel(workIds, buildIndex, numThreads, false);
+
+	//step 2 (parallel over chunks of segments): cluster segments based on
+	//their overlaps. Chunks of large node pairs go first for load balancing.
+	struct Chunk
+	{
+		size_t workId;
+		size_t begin;
+		size_t end;
+	};
+	const size_t CHUNK_SIZE = 256;
+	std::vector<size_t> workBySize = workIds;
+	std::stable_sort(workBySize.begin(), workBySize.end(),
+					 [&works](size_t a, size_t b)
+					 {return works[a].segments->size() > works[b].segments->size();});
+	std::vector<Chunk> chunks;
+	for (size_t workId : workBySize)
+	{
+		size_t n = works[workId].segments->size();
+		for (size_t begin = 0; begin < n; begin += CHUNK_SIZE)
+		{
+			chunks.push_back({workId, begin, std::min(n, begin + CHUNK_SIZE)});
+		}
+	}
+
+	std::function<void(const Chunk&)> clusterChunk = 
+	[&works, &asmOverlaps, &segIntersect](const Chunk& chunk)
+	{
+		auto& w = works[chunk.workId];
+		auto& segs = *w.segments;
+		auto& dsu = *w.dsu;
+		for (size_t i = chunk.begin; i < chunk.end; ++i)
+		{
+			const EdgeSequence& segOne = segs[i];
 			for (auto& interval : asmOverlaps
-					.getCoveringOverlaps(setOne->data->origSeqId, 
-										 setOne->data->origSeqStart,
-										 setOne->data->origSeqEnd))
+					.getCoveringOverlaps(segOne.origSeqId, 
+										 segOne.origSeqStart,
+										 segOne.origSeqEnd))
 			{
 				auto& ovlp = *interval.value;
 				int32_t intersectOne = 
-					segIntersect(*setOne->data, ovlp.curBegin, ovlp.curEnd);
+					segIntersect(segOne, ovlp.curBegin, ovlp.curEnd);
 				if (intersectOne <= 0) continue;
 
-				auto& ss = segmentIndex[ovlp.extId];
-				auto cmpBegin = [] (const SetSegment* s, int32_t pos)
-								    {return s->data->origSeqStart < pos;};
-				auto cmpEnd = [] (const SetSegment* s, int32_t pos)
-								    {return s->data->origSeqEnd < pos;};
+				auto ssIt = w.index.find(ovlp.extId);
+				if (ssIt == w.index.end()) continue;
+				auto& ss = ssIt->second;
+				auto cmpBegin = [&segs] (size_t s, int32_t pos)
+								    {return segs[s].origSeqStart < pos;};
+				auto cmpEnd = [&segs] (size_t s, int32_t pos)
+								    {return segs[s].origSeqEnd < pos;};
 				auto startRange = std::lower_bound(ss.begin(), ss.end(),
 												   ovlp.extBegin, cmpEnd);
 				auto endRange = std::lower_bound(ss.begin(), ss.end(),
@@ -831,119 +988,68 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 				if (endRange != ss.end()) ++endRange;
 				for (;startRange != endRange; ++startRange)
 				{
-					auto* setTwo = *startRange;
-					if (findSet(setOne) == findSet(setTwo)) continue;
+					size_t j = *startRange;
+					if (dsu.find(i) == dsu.find(j)) continue;
 
-					int32_t projStart = ovlp.project(setOne->data->origSeqStart);
-					int32_t projEnd = ovlp.project(setOne->data->origSeqEnd);
+					int32_t projStart = ovlp.project(segOne.origSeqStart);
+					int32_t projEnd = ovlp.project(segOne.origSeqEnd);
 					int32_t projIntersect =
-						segIntersect(*setTwo->data, projStart, projEnd);
+						segIntersect(segs[j], projStart, projEnd);
 
-					if (projIntersect > setOne->data->seqLen / 2 && 
-						projIntersect > setTwo->data->seqLen / 2)
+					if (projIntersect > segOne.seqLen / 2 && 
+						projIntersect > segs[j].seqLen / 2)
 					{
-						unionSet(setOne, setTwo);
+						dsu.unite(i, j);
 					}
 				}
 			}
 		}
-		auto edgeClusters = groupBySet(segmentSets);
-		/*if (edgeClusters.size() > 0)
+	};
+	processInParallel(chunks, clusterChunk, numThreads, false);
+	Logger::get().debug() << "Clustered segments in " << chunks.size() << " chunks";
+
+	//step 3 (parallel over node pairs): group, sort clusters for determinism,
+	//filter singletons
+	std::atomic<size_t> singletonsFiltered(0);
+	std::function<void(const size_t&)> groupClusters = 
+	[&works, &asmOverlaps, &segIntersect, &singletonsFiltered]
+	(const size_t& workId)
+	{
+		auto& w = works[workId];
+		auto& segs = *w.segments;
+		auto& dsu = *w.dsu;
+
+		std::vector<std::vector<EdgeSequence*>> edgeClusters;
+		std::unordered_map<size_t, size_t> rootToCluster;
+		for (size_t i = 0; i < segs.size(); ++i)
 		{
-			Logger::get().debug() << "Node with " << segmentSets.size() << " segments";
-			Logger::get().debug() << "clusters: " << edgeClusters.size();
-			for (auto& edgeClust : edgeClusters)
+			size_t root = dsu.find(i);
+			auto it = rootToCluster.find(root);
+			if (it == rootToCluster.end())
 			{
-				int sumLen = 0;
-				for (auto s : edgeClust.second) sumLen += s->seqLen;
-				Logger::get().debug() << "\tcl: " << edgeClust.second.size()
-					<< " " << sumLen / edgeClust.second.size() << " "
-					<< edgeClust.first;
-				
-				if (edgeClust.second.size() < 10)
-				{
-					for (auto s : edgeClust.second)
-					{
-						Logger::get().debug() << "\t\t" << _asmSeqs.seqName(s->origSeqId)
-							<< " " << s->origSeqStart << " " << s->seqLen;
-
-						//////////
-						if (edgeClust.second.size() <= 3)
-						{
-							auto segOne = s;
-							for (auto& interval : asmOverlaps
-									.getCoveringOverlaps(segOne->origSeqId, segOne->origSeqStart,
-														 segOne->origSeqEnd))
-							{
-								auto& ovlp = *interval.value;
-								int32_t intersectOne = 
-									segIntersect(*segOne, ovlp.curBegin, ovlp.curEnd);
-								if (intersectOne < segOne->seqLen / 2) continue;
-
-								auto& ss = segmentIndex[ovlp.extId];
-								auto cmpBegin = [] (const SetSegment* s, int32_t pos)
-													{return s->data->origSeqStart < pos;};
-								auto cmpEnd = [] (const SetSegment* s, int32_t pos)
-													{return s->data->origSeqEnd < pos;};
-								auto startRange = std::lower_bound(ss.begin(), ss.end(),
-																   ovlp.extBegin, cmpEnd);
-								auto endRange = std::lower_bound(ss.begin(), ss.end(),
-																 ovlp.extEnd, cmpBegin);
-								if (endRange != ss.end()) ++endRange;
-								for (;startRange != endRange; ++startRange)
-								{
-									auto* setTwo = *startRange;
-									if (segOne->origSeqStart == setTwo->data->origSeqStart &&
-										segOne->origSeqEnd == setTwo->data->origSeqEnd) continue;
-
-									//projecting the interval endpoints
-									//(overlap might be covering the actual segment)
-									int32_t projStart = ovlp.project(segOne->origSeqStart);
-									int32_t projEnd = ovlp.project(segOne->origSeqEnd);
-									int32_t projIntersect =
-										segIntersect(*setTwo->data, projStart, projEnd);
-									
-									if (projIntersect > 0)
-									{
-										Logger::get().debug() << "\t\t\t" 
-											<< _asmSeqs.seqName(setTwo->data->origSeqId) << " "
-											<< setTwo->data->origSeqStart << " " 
-											<< setTwo->data->origSeqEnd << " "
-											<< intersectOne << " " 
-											<< projIntersect << " " << findSet(setTwo);
-									}
-								}
-							}
-						}
-					}
-					///////////
-				}
-				else
-				{
-					Logger::get().debug() << "\t\t\t...";
-				}
+				it = rootToCluster.emplace(root, edgeClusters.size()).first;
+				edgeClusters.emplace_back();
 			}
-		}*/
+			edgeClusters[it->second].push_back(&segs[i]);
+		}
 
 		//sort clusters for determinism
-		std::unordered_map<SetSegment*, 
-						   std::pair<FastaRecord::Id, int32_t>> sortOrder;
+		std::vector<std::pair<FastaRecord::Id, int32_t>> sortOrder;
 		for (auto& cl : edgeClusters)
 		{
 			EdgeSequence* minEdge = 
-				*std::min_element(cl.second.begin(), cl.second.end(),
+				*std::min_element(cl.begin(), cl.end(),
 						  [](EdgeSequence* const e1, EdgeSequence* const e2)
 						     {return std::make_pair(e1->origSeqId, e1->origSeqStart) <
 								     std::make_pair(e2->origSeqId, e2->origSeqStart);});
-			sortOrder[cl.first] = std::make_pair(minEdge->origSeqId, minEdge->origSeqStart);
+			sortOrder.push_back(std::make_pair(minEdge->origSeqId, 
+											   minEdge->origSeqStart));
 		}
-		std::vector<SetSegment*> sortedKeysCl;
-		for (auto& it : edgeClusters) sortedKeysCl.push_back(it.first);
-		sortByKey(sortedKeysCl, [&sortOrder](SetSegment* const n){return sortOrder[n];});
+		std::vector<size_t> sortedClusters;
+		for (size_t i = 0; i < edgeClusters.size(); ++i) sortedClusters.push_back(i);
+		sortByKey(sortedClusters, [&sortOrder](size_t const n){return sortOrder[n];});
 
-		//add edge for each cluster
-		std::vector<EdgeSequence> usedSegments;
-		for (auto& clustId : sortedKeysCl)
+		for (size_t clustId : sortedClusters)
 		{
 			auto& matchEdges = edgeClusters[clustId];
 			//filtering segments that were not glued, but covered by overlaps
@@ -966,11 +1072,23 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 					continue;
 				}
 			}
+			w.clusters.push_back(std::move(matchEdges));
+		}
+		w.dsu.reset();
+		w.index.clear();
+	};
+	processInParallel(workIds, groupClusters, numThreads, false);
 
+	//step 4 (sequential, deterministic): add edges for each cluster
+	for (auto& w : works)
+	{
+		NodePair nodePair = w.nodePair;
+		std::unordered_set<EdgeSequence, EdgeSeqHash, EdgeSeqEqual> usedSegments;
+		for (auto& matchEdges : w.clusters)
+		{
 			//in case we have complement edges within the node pair
 			auto& anySegment = *matchEdges.front();
-			if (std::find(usedSegments.begin(), usedSegments.end(), anySegment) 
-						  != usedSegments.end()) continue;
+			if (usedSegments.count(anySegment)) continue;
 
 			GraphNode* leftNode = nodePair.first;
 			GraphNode* rightNode = nodePair.second;
@@ -978,12 +1096,11 @@ void RepeatGraph::initializeEdges(const OverlapContainer& asmOverlaps)
 			for (auto& seg : matchEdges)
 			{
 				newEdge.seqSegments.push_back(*seg);
-				usedSegments.push_back(seg->complement());
+				usedSegments.insert(seg->complement());
 			}
 
 			//check if it's self-complmenet
-			bool selfComplement = std::find(usedSegments.begin(), 
-						usedSegments.end(), anySegment) != usedSegments.end();
+			bool selfComplement = usedSegments.count(anySegment) > 0;
 			newEdge.selfComplement = selfComplement;
 
 			this->addEdge(std::move(newEdge));
